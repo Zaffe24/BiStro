@@ -5,6 +5,19 @@ Somatic single-base substitution caller for PacBio Revio single-strand CCS duple
 BiStro is both a standalone command-line tool and a Snakemake pipeline that chains
 its four stages together across a whole cohort of samples.
 
+## Contents
+
+- [Installation](#installation)
+- [Usage](#usage)
+  - [`bistro preprocess`](#bistro-preprocess)
+  - [`bistro somatic`](#bistro-somatic)
+  - [`bistro sbs96`](#bistro-sbs96)
+  - [`bistro cosmic`](#bistro-cosmic)
+- [Running the full pipeline with Snakemake](#running-the-full-pipeline-with-snakemake)
+- [Reference data](#reference-data)
+- [Citation](#citation)
+- [License](#license)
+
 ## Installation
 
 ```bash
@@ -34,12 +47,12 @@ BiStro has four subcommands, run in sequence:
 
 | Subcommand | Purpose |
 |---|---|
-| `bistro preprocess` | Pre-process single-strand CCS reads into candidate mutation calls. |
-| `bistro somatic` | Call true somatic mutations and rates from pre-processed candidate calls across samples. |
-| `bistro sbs96` | Correct the somatic SBS96 spectrum for trinucleotide opportunity biases. |
-| `bistro cosmic` | Cosine similarity of a BiStro SBS96 spectrum against COSMIC signatures. |
+| [`bistro preprocess`](#bistro-preprocess) | Pre-process single-strand CCS reads into candidate mutation calls. |
+| [`bistro somatic`](#bistro-somatic) | Call true somatic mutations and rates from pre-processed candidate calls across samples. |
+| [`bistro sbs96`](#bistro-sbs96) | Correct the somatic SBS96 spectrum for trinucleotide opportunity biases. |
+| [`bistro cosmic`](#bistro-cosmic) | Cosine similarity of a BiStro SBS96 spectrum against COSMIC signatures. |
 
-Run `bistro <subcommand> --help` for the full list of options for each stage.
+Run `bistro <subcommand> --help` at any time for this same information from the CLI itself.
 
 ### Example: single sample, by hand
 
@@ -51,7 +64,84 @@ bistro sbs96 --context out/S01.shared.context.bed.gz --muts out/S01.shared.muts.
 bistro cosmic -i out/S01.normcounts.tsv --out out/S01.SBS_cosine_similarity.tsv
 ```
 
-### Running the full pipeline with Snakemake
+### `bistro preprocess`
+
+Pre-processes single-strand CCS reads into candidate mutation calls.
+
+| Flag | Default | Description |
+|---|---|---|
+| `-i, --bam` *(required)* | -- | BAM file with single-strand CCS reads aligned via `pbmm2 align --preset CCS`. |
+| `-r, --ref` *(required)* | -- | Reference genome FASTA file. |
+| `-g, --germline_vcf` | `None` | VCF file with germline mutations. Somatic mutations will not be called at these positions. |
+| `--min_gq` | `20` | Minimum Genotype Quality used to flag positions with germline variants. |
+| `-o, --out_dir` *(required)* | -- | Output directory to write the results. |
+| `-s, --sample` | `TrySample` | Sample name to be used in the output files. |
+| `--region` | `""` | Target chromosome(s) to call mutations on, e.g. `chr1 chr2 chr3`. |
+| `--exclude` | `""` | Chromosome(s) to exclude from mutation calling, e.g. `chr1 chr2 chr3`. |
+| `-t, --threads` | `1` | Number of threads to use for parallel processing. |
+| `--min_mapq` | `60` | Minimum mapping quality score for reads to be considered. |
+| `--min_sequence_identity` | `0.99` | Minimum sequence identity threshold for reads to be considered. |
+| `--min_bq` | `93` | Minimum base quality score for both positions of a base pair to be considered. |
+| `--min_qlen` | `800` | Minimum read length for reads to be considered. |
+| `--max_qlen` | `10000` | Maximum read length for reads to be considered. |
+| `--min_depth` | `3` | Minimum read coverage to be considered. |
+| `--trim_ends` | `0.025` | Bases to trim from each read's ends. `< 1` is a proportion of read length; `>= 1` is an absolute base count. |
+| `--indels_window` | `10` | Window size for indel filtering: indels within this window around a candidate SBS are used to filter it out. |
+| `--mismatch_window_len` | `20` | Window size for mismatch filtering: mismatches within this window around a candidate variant are recorded. |
+| `--min_ec` | `5` | Minimum effective coverage (EC) for a candidate variant to be considered. |
+| `--min_rq` | `0.99` | Minimum read quality (RQ) for reads to be considered. |
+| `--max_softclipping` | `0.2` | Maximum proportion of soft-clipped bases allowed in a read. |
+| `--z_prob` | `0` | Debug feature: set to `1000000` to randomly record a reference base pair with probability 1/1000000, for error-model estimation. `0` disables it. |
+| `--check_mem_usage` | `10000` | How often (in processed ZMW duplexes) to check memory usage. `0` disables the check. |
+| `--do_not_collapse` | `True` | Report mutations at the read level without collapsing to ZMW duplexes. Useful for debugging and error-model estimation. |
+| `--low_complexity_regions` | `None` | BED file of intervals to exclude from the mutation and context outputs (e.g. repeat/low-complexity regions). |
+
+### `bistro somatic`
+
+Calls true somatic mutations and per-sample mutation rates from pre-processed candidate calls, across samples.
+
+| Flag | Default | Description |
+|---|---|---|
+| `-i` *(required)* | -- | One or more `.muts.bed.gz` files produced by `preprocess`. |
+| `--thr` | `1` | Minimum number of *other* samples that must show a mutation before it stops being treated as private -- either by carrying a call at that position (annotated germline), or, when `--bams` is given, by carrying read support for its ALT allele (annotated FPD). |
+| `--max_muts_per_duplex` | `2` | Maximum number of DNMs allowed per ZMW duplex; duplexes exceeding this are flagged FPD (false positive de novo). |
+| `--ref` *(required)* | -- | Reference genome FASTA file (indexed), used to determine the chromosome list. |
+| `--bams` | `None` | Indexed BAM file per sample, in the **same order** as `-i`. Enables the final safeguard: a de novo mutation whose ALT allele is supported by reads in other samples' BAMs is re-flagged FPD. Omit to skip the check. |
+| `--min_alt_support` | `1` | Minimum number of high-quality reads carrying the ALT allele for another sample's BAM to count as supporting that allele. |
+| `--min_mapq` | `30` | Minimum mapping quality for a read to be counted in the `--bams` pileup safeguard. |
+| `--min_baseq` | `70` | Minimum base quality for a base to be counted in the `--bams` pileup safeguard. |
+| `-t, --threads` | `1` | Number of parallel worker processes. |
+
+### `bistro sbs96`
+
+Corrects the somatic SBS96 spectrum for trinucleotide opportunity biases.
+
+| Flag | Default | Description |
+|---|---|---|
+| `--context` *(required)* | -- | `SAMPLE.shared.context.bed.gz` (already-cleaned callable bases). |
+| `--muts` *(required)* | -- | `SAMPLE.shared.muts.bed.gz` (annotated somatic calls). |
+| `-r, --ref` | `None` | Reference genome FASTA file (indexed), used to compute genome composition. Required unless `--preset_genome` is given. |
+| `--preset_genome` | `None` | One of `GRCh38`, `GRCm39`. Takes the genome composition from a hardcoded table for this assembly, skipping the `--ref` scan (overrides `--ref`). |
+| `-o, --out` *(required)* | -- | Output normcounts TSV. |
+| `--plot` | `None` | Output SBS96 spectrum image (PDF/PNG). Defaults to `--out` with its extension replaced by `.pdf`. |
+| `-s, --sample` | `None` | Sample name for the plot title. Defaults to the `--out` basename. |
+| `--no_plot` | *(flag)* | Write only the TSV; skip the spectrum image. |
+| `-t, --threads` | `1` | Worker processes for the shared-context scan (one contig per worker). |
+
+### `bistro cosmic`
+
+Computes the cosine similarity of a BiStro SBS96 spectrum against COSMIC signatures.
+
+| Flag | Default | Description |
+|---|---|---|
+| `-i, --input` *(required)* | -- | `SAMPLE.normcounts.tsv` produced by `sbs96`. |
+| `--sign_file` | bundled COSMIC v3.6 GRCh38 | COSMIC SBS96 signature file (SigProfiler `Type\tSBS1\tSBS2...` layout). |
+| `--signatures` | `None` (every signature) | Optional subset of signatures to compare against, e.g. `--signatures SBS1 SBS5 SBS40`. |
+| `--column` | `Human_normfrac` | `normcounts.tsv` column to use as the sample spectrum -- `Human_normfrac` is the spectrum corrected on human-genome opportunity, which is what COSMIC signatures are defined on. |
+| `-o, --out` | `None` (stdout) | Output TSV. |
+| `--top` | `None` | Report only the N best-matching signatures. |
+
+## Running the full pipeline with Snakemake
 
 The `workflow/` directory holds a Snakemake pipeline that runs all four stages
 (plus an optional DeepVariant germline-calling step) across every sample listed
@@ -81,6 +171,16 @@ should you need it for a genome build other than the ones already hardcoded in
 BiStro ships with COSMIC v3.6 SBS signature files (`GRCh38` and `mm10`) used as
 the default input to `bistro cosmic`; override with `--sign_file` for another
 COSMIC release or genome build.
+
+## Citation
+
+If you use BiStro in your work, please cite it:
+
+> Zafferani, P. BiStro (2026). https://github.com/Zaffe24/BiStro
+
+Machine-readable citation metadata is provided in [CITATION.cff](CITATION.cff)
+(GitHub surfaces this automatically via the "Cite this repository" button on
+the repo's main page).
 
 ## License
 
