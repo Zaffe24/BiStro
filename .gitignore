@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+*.egg-info/
+build/
+dist/
+
+.snakemake/
+runs/
+snk_logs/
+*.log
+
+.env

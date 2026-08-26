@@ -1,0 +1,327 @@
+# ---------------------------------------------------------------------------
+# BiStro end-to-end pipeline over the samples listed in
+# config["input"]["samples_tsv"]:
+#   call_deepvariant (per-sample germline calls, optional) -> call_somatic
+#   (per-sample read pre-processing: runs the `preprocess` subcommand to
+#   extract candidate mutations from CCS duplex reads) -> call_rate (ONE rule
+#   taking every sample together: runs the `somatic` subcommand for shared
+#   callable space, cross-sample/cross-read false positive reclassification,
+#   and per-sample mutation rate) -> call_sbs96 (per-sample
+#   trinucleotide-corrected SBS96 spectrum) -> call_cosmic (per-sample cosine
+#   similarity to COSMIC signatures). See rule `all` for the final target.
+# ---------------------------------------------------------------------------
+
+# No hardcoded default: always invoke with --configfile pointing at your copy
+# of config/config.yaml (see main_Snakemake.sh for an example).
+
+import csv
+import os
+import shutil
+import sys
+from datetime import datetime
+
+import pandas as pd
+
+
+# ---------------------------------------------------------------------------
+# Auxiliary functions
+# ---------------------------------------------------------------------------
+def date():
+    return f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}]"
+
+
+def cprint(text="", color="cyan", sep="", file=sys.stderr):
+    colors = {
+        "red": "\033[31m",
+        "green": "\033[32m",
+        "yellow": "\033[33m",
+        "blue": "\033[34m",
+        "purple": "\033[35m",
+        "magenta": "\033[35m",
+        "cyan": "\033[36m",
+        "white": "\033[37m",
+    }
+    reset = "\033[0m"
+
+    # Only use colors if output is a real terminal
+    if hasattr(file, "isatty") and file.isatty():
+        color_code = colors.get(color, "")
+        print(f"{color_code}{text}{reset}", sep=sep, file=file)
+    else:
+        print(text, sep=sep, file=file)
+
+
+def get_path(*files):
+    return os.path.join(*files)
+
+
+def load_samples(input_table):
+    df = pd.read_csv(input_table, sep="\t", header=None, index_col=1, comment="#")
+    d = {ind: el[0] for ind, el in df.iterrows()}
+    return list(d.keys()), d
+
+
+def get_mem_mb(rule_name, attempt):
+    base = config["custom_resources"][rule_name]["mem_mb"]
+    return base * attempt
+
+
+def get_threads(rule_name, attempt):
+    base = config["custom_resources"][rule_name]["threads"]
+    return base * int(attempt)
+
+
+def extra_preprocess(category):
+    extra = ""
+    if config["target_regions"]:
+        extra += f"--region {config["target_regions"]} "
+    if config["exclude_regions"]:
+        extra += f"--exclude {config["exclude_regions"]} "
+
+    for key, value in config[category].items():
+        if value is None or value is False or value == "":
+            continue
+        extra += f" --{key}"
+        if value is not True:
+            extra += f" {value}"
+
+    return extra
+
+
+def extra_cosmic():
+    extra = ""
+    for key in ("signatures", "column", "top", "sign_file"):
+        value = config["call_cosmic"][key]
+        if value is None or value is False or value == "":
+            continue
+        extra += f" --{key}"
+        if value is not True:
+            extra += f" {value}"
+
+    return extra
+
+
+def extra_sbs96():
+    extra = ""
+    for key, value in config["call_sbs96"].items():
+        if value is None or value is False or value == "":
+            continue
+        extra += f" --{key}"
+        if value is not True:
+            extra += f" {value}"
+
+    return extra
+
+# ---------------------------------------------------------------------------
+# Input variables
+# ---------------------------------------------------------------------------
+SAMPLES, BAM_BY_SAMPLE = load_samples(config["input"]["samples_tsv"])
+OUT_DIR = config["input"]["output_directory"]
+REFERENCE = config["input"]["fasta"]
+DEEP_OUT = config["run_deepvariant"]
+
+
+# ---------------------------------------------------------------------------
+# Rules
+# ---------------------------------------------------------------------------
+
+localrules: all, call_cosmic,
+
+rule all:
+    input:
+        expand(get_path(OUT_DIR, "{sample}.SBS_cosine_similarity.tsv"), sample=SAMPLES),
+        expand(get_path(OUT_DIR, "{sample}.normcounts.tsv"), sample=SAMPLES),
+
+
+rule call_deepvariant:
+    input:
+        lambda wc: BAM_BY_SAMPLE[wc.sample],
+    output:
+        get_path(OUT_DIR, "{sample}.germline.vcf.gz"),
+    log:
+        get_path(OUT_DIR, "logs", "{sample}_call_deepvariant.log"),
+    threads: lambda wildcards, attempt: get_threads("call_deepvariant", attempt),
+    resources:
+        mem_mb=lambda wildcards, attempt: get_mem_mb("call_deepvariant", attempt),
+        runtime=config["custom_resources"]["call_deepvariant"]["runtime"],
+        partition=config["custom_resources"]["call_deepvariant"]["partition"],
+    params:
+        out=lambda wc: get_path(OUT_DIR, f"{wc.sample}.germline.vcf"),
+        reference=REFERENCE,
+        region=f"--regions {config['target_regions']}" if config["target_regions"] else "",
+        tmp=lambda wc: get_path(OUT_DIR, wc.sample, "tmp"),
+        deepv_setup=config["deepvariant_setup"],
+        deepv_cmd=config["deepvariant_cmd"],
+    shell:
+        """
+        set -euo pipefail
+        {params.deepv_setup} &>/dev/null
+        exec > {log} 2>&1
+
+        {params.deepv_cmd} --model_type=PACBIO \
+            --ref={params.reference} \
+            --reads={input} \
+            --output_vcf={params.out} \
+            --num_shards={threads} \
+            --sample_name={wildcards.sample} \
+            {params.region}
+
+        bgzip -c {params.out} > {output}
+        tabix -p vcf {output}
+
+        rm -fr {params.tmp}
+        """
+
+
+rule call_preprocess:
+    input:
+        bam=lambda wc: BAM_BY_SAMPLE[wc.sample],
+        germ=rules.call_deepvariant.output if DEEP_OUT else [],
+    output:
+        muts=get_path(OUT_DIR, "{sample}.muts.bed.gz"),
+        ctx=get_path(OUT_DIR, "{sample}.context.bed.gz"),
+    log:
+        get_path(OUT_DIR, "logs", "{sample}_call_preprocess.log"),
+    threads: lambda wildcards, attempt: get_threads("call_preprocess", attempt),
+    resources:
+        mem_mb=lambda wildcards, attempt: get_mem_mb("call_preprocess", attempt),
+        runtime=config["custom_resources"]["call_preprocess"]["runtime"],
+        partition=config["custom_resources"]["call_preprocess"]["partition"],
+    params:
+        set_up=config["bistro_setup"],
+        cmd=config["bistro_cmd"],
+        reference=REFERENCE,
+        out_dir=OUT_DIR,
+        target_chr=config["target_regions"],
+        exclude_chr=config["exclude_regions"],
+        extra=extra_preprocess("call_preprocess"),
+        germline=lambda wc, input: f"--germline_vcf {input.germ}" if DEEP_OUT else "",
+    shell:
+        """
+        set -euo pipefail
+        # {params.set_up}
+        exec > {log} 2>&1
+
+        cd $HOME
+        {params.cmd} preprocess \
+            --bam {input.bam} \
+            {params.germline} \
+            --ref {params.reference} \
+            --out_dir {params.out_dir} \
+            --sample {wildcards.sample} \
+            --threads {threads} \
+            {params.extra}
+        """
+
+
+rule call_somatic:
+    input:
+        muts=expand(rules.call_preprocess.output.muts, sample=SAMPLES),
+        # Same SAMPLES order as muts: `somatic --bams` is matched positionally against -i.
+        bams=[BAM_BY_SAMPLE[s] for s in SAMPLES],
+    output:
+        rate=get_path(OUT_DIR, f"{"_".join(SAMPLES)}.mutation_rates.tsv"),
+        # Consumed only by call_sbs96; dropped once each sample's spectrum is written.
+        shared_ctx=expand(get_path(OUT_DIR, "{sample}.shared.context.bed.gz"), sample=SAMPLES),
+        shared_ctx_tbi=expand(get_path(OUT_DIR, "{sample}.shared.context.bed.gz.tbi"), sample=SAMPLES),
+        shared_mut=expand(get_path(OUT_DIR, "{sample}.shared.muts.bed.gz"), sample=SAMPLES),
+    log:
+        get_path(OUT_DIR, "logs", "call_somatic.log"),
+    threads: lambda wildcards, attempt: get_threads("call_somatic", attempt),
+    resources:
+        mem_mb=lambda wildcards, attempt: get_mem_mb("call_somatic", attempt),
+        runtime=config["custom_resources"]["call_somatic"]["runtime"],
+        partition=config["custom_resources"]["call_somatic"]["partition"],
+    params:
+        cmd=config["bistro_cmd"],
+        thr=config["call_somatic"]["threshold"],
+        max_dn=config["call_somatic"]["max_muts_per_duplex"],
+        min_alt_support=config["call_somatic"]["min_alt_support"],
+        min_mapq=config["call_somatic"]["min_mapq"],
+        min_baseq=config["call_somatic"]["min_baseq"],
+        fasta=REFERENCE,
+    shell:
+        """
+        set -euo pipefail
+        exec > {log} 2>&1
+
+        cd $HOME
+        {params.cmd} somatic \
+            -i {input.muts} \
+            --bams {input.bams} \
+            --thr {params.thr} \
+            -t {threads} \
+            --max_muts_per_duplex {params.max_dn} \
+            --min_alt_support {params.min_alt_support} \
+            --min_mapq {params.min_mapq} \
+            --min_baseq {params.min_baseq} \
+            --ref {params.fasta}
+        """
+
+
+rule call_sbs96:
+    input:
+        ctx=get_path(OUT_DIR, "{sample}.shared.context.bed.gz"),
+        # Not passed on the command line: read_shared_context() seeks per contig through
+        # this index. Declared so temp() keeps it alive until the spectrum is written.
+        ctx_tbi=get_path(OUT_DIR, "{sample}.shared.context.bed.gz.tbi"),
+        mut=get_path(OUT_DIR, "{sample}.shared.muts.bed.gz"),
+    output:
+        get_path(OUT_DIR, "{sample}.normcounts.tsv"),
+    log:
+        get_path(OUT_DIR, "logs", "{sample}_call_sbs96.log"),
+    threads: lambda wildcards, attempt: get_threads("call_sbs96", attempt),
+    resources:
+        mem_mb=lambda wildcards, attempt: get_mem_mb("call_sbs96", attempt),
+        runtime=config["custom_resources"]["call_sbs96"]["runtime"],
+        partition=config["custom_resources"]["call_sbs96"]["partition"],
+    params:
+        cmd=config["bistro_cmd"],
+        fasta=REFERENCE,
+        extra = extra_sbs96()
+    shell:
+        """
+        set -euo pipefail
+        exec > {log} 2>&1
+
+        cd $HOME
+        {params.cmd} sbs96 \
+            --context {input.ctx} \
+            --muts {input.mut} \
+            --ref {params.fasta} \
+            --out {output} \
+            -t {threads} \
+            {params.extra}
+        """
+
+
+rule call_cosmic:
+    input:
+        rules.call_sbs96.output,
+    output:
+        get_path(OUT_DIR, "{sample}.SBS_cosine_similarity.tsv"),
+    log:
+        get_path(OUT_DIR, "logs", "{sample}_call_cosmic.log"),
+    params:
+        cmd=config["bistro_cmd"],
+        extra=extra_cosmic(),
+    shell:
+        """
+        set -euo pipefail
+        exec > {log} 2>&1
+
+        cd $HOME
+        {params.cmd} cosmic \
+            -i {input} \
+            {params.extra} \
+            --out {output}
+        """
+
+
+
+onstart:
+    cprint(f"{date()} [snk] Python: {sys.version}")
+    cprint(f"{date()} [snk] STARTING ------ BiStro ------")
+    cprint(f"{date()} [snk] SAMPLES LOADED:")
+    for sample, bam in BAM_BY_SAMPLE.items():
+        cprint(f"{''.join(['-']*len(date()))} [snk] {sample}\t{bam}")

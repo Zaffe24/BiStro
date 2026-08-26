@@ -1,0 +1,11 @@
+cff-version: 1.2.0
+message: "If you use BiStro, please cite it as below."
+title: "BiStro"
+abstract: "Somatic single-base substitution caller for PacBio Revio single-strand CCS duplex reads."
+authors:
+  - family-names: Zafferani
+    given-names: Pietro
+repository-code: "https://github.com/Zaffe24/BiStro"
+license: MIT
+version: 1.0.0
+date-released: "2026-08-26"
