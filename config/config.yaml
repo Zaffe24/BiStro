@@ -1,0 +1,84 @@
+# ---------------------------------------------------------------------------
+# BiStro Snakemake pipeline configuration (template).
+# Copy this file, fill in your own paths, and pass it to Snakemake with
+# --configfile (see workflow/README or main_Snakemake.sh).
+# ---------------------------------------------------------------------------
+
+input:
+  samples_tsv: "path/to/samples.tsv"    # TSV, no header: <path/to/sample.bam>\t<sample_id>
+  fasta: "path/to/reference.fa.gz"      # reference genome, bgzip-compressed + indexed
+  output_directory: "path/to/output/"
+
+run_deepvariant: False
+deepvariant_setup: ""    # shell snippet to make `deepvariant` available (module load / singularity bind), leave blank if not needed
+deepvariant_cmd: "deepvariant"
+
+bistro_setup: ""         # shell snippet to activate BiStro's environment before each rule, e.g. "conda activate bistro"
+bistro_cmd: "python -m bistro"
+
+target_regions: ""       # e.g. "chr1,chr2" -- restrict calling to these contigs
+exclude_regions: ""      # e.g. "chrM" -- exclude these contigs
+
+# Passed straight through to `bistro preprocess`. See `bistro preprocess --help`.
+call_preprocess:
+  low_complexity_regions: ""   # optional: BED of low-complexity regions to mask (e.g. sdust output)
+  min_gq: 20
+  min_mapq: 60
+  min_sequence_identity: .99
+  min_bq: 93
+  min_qlen: 800
+  max_qlen: 10000
+  min_depth: 3
+  trim_percentage: .05
+  indels_window: 10
+  mismatch_window_len: 50
+  min_ec: 5
+  min_rq: .99
+  max_softclipping: .2
+  z_prob: 1000000
+  check_mem_usage: 100000
+  #do_not_collapse: True
+
+# Passed straight through to `bistro somatic`. See `bistro somatic --help`.
+call_somatic:
+  threshold: 1              # --thr: how many OTHER samples must show a variant before it stops counting as private
+  max_muts_per_duplex: 1
+  min_alt_support: 1
+  min_mapq: 30
+  min_baseq: 70
+
+# Passed straight through to `bistro sbs96`. See `bistro sbs96 --help`.
+call_sbs96:
+  preset_genome:    # optional, e.g. GRCh38 / GRCm39 -- skips the whole-genome FASTA scan
+
+# Passed straight through to `bistro cosmic`. See `bistro cosmic --help`.
+call_cosmic:
+  sign_file:        # optional -- defaults to the COSMIC v3.6 GRCh38 signatures bundled with BiStro
+  signatures:
+  column:           # optional -- defaults to Human_normfrac
+  top:
+
+custom_resources:
+  call_deepvariant:
+    mem_mb: 36000
+    runtime: 360
+    threads: 32
+    partition: "short"
+
+  call_preprocess:
+    mem_mb: 44000
+    runtime: 360
+    threads: 20
+    partition: "short"
+
+  call_somatic:
+    mem_mb: 120000
+    runtime: 360
+    threads: 20
+    partition: "short"
+
+  call_sbs96:
+    mem_mb: 8000
+    runtime: 120
+    threads: 20
+    partition: "short"

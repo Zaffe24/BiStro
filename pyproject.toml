@@ -1,0 +1,32 @@
+[project]
+name = "BiStro"
+version = "1.0.0"
+description = "Somatic single-base substitution caller for PacBio Revio single-strand CCS duplex reads"
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "MIT" }
+authors = [{ name = "Pietro Zafferani" }]
+dependencies = [
+    "pysam",
+    "pandas",
+    "numpy",
+    "scipy",
+    "matplotlib",
+    "psutil",
+]
+
+[project.urls]
+Homepage = "https://github.com/Zaffe24/BiStro"
+
+[project.scripts]
+bistro = "bistro.__main__:main"
+
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+"bistro.data" = ["*.txt"]

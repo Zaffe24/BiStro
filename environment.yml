@@ -1,0 +1,17 @@
+name: bistro
+channels:
+  - bioconda
+  - conda-forge
+dependencies:
+  - python>=3.12
+  - pysam
+  - pandas
+  - numpy
+  - scipy
+  - matplotlib
+  - psutil
+  - htslib          # bgzip, tabix -- used by the Snakemake pipeline
+  - snakemake       # only needed to run the workflow/Snakefile pipeline
+  - pip
+  - pip:
+      - -e .
