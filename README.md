@@ -1,9 +1,13 @@
-# BiStro
 
-Somatic single-base substitution caller for PacBio Revio single-strand CCS duplex reads.
+  
+
+
+<img src=".github/Bistro_logo.svg" width="350" alt="BiStro logo"> 
+
+## BiStro: a Somatic single-base substitution caller for PacBio Revio single-strand CCS duplex reads.
 
 BiStro is both a standalone command-line tool and a Snakemake pipeline that chains
-its four stages together across a whole cohort of samples.
+its four stages together across multiple samples.
 
 ## Contents
 
