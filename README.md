@@ -1,4 +1,3 @@
-
 # <img src=".github/Bistro_logo.svg" width="200" align="left">  <br> BiStro v1.0.0
 <br>
 
@@ -21,7 +20,7 @@ To discriminate between germline and *de novo* mutations (DNMs), BiStro relies o
   - [`bistro sbs96`](#bistro-sbs96)
   - [`bistro cosmic`](#bistro-cosmic)
 - [Running the full pipeline with Snakemake](#running-the-full-pipeline-with-snakemake)
-- [Reference data](#reference-data)
+- [Reference data](#reference-data-and-Testing)
 - [Citation](#citation)
 
 ## Installation
@@ -70,6 +69,8 @@ Run `bistro <subcommand> --help` at any time to expose the complete parameter li
 
 Pre-processes single-strand CCS reads into candidate mutation calls.
 
+**How it works:** For each contig, BiStro brings together every duplex's forward and reverse single-strand CCS reads and walks their jointly aligned positions. A position only enters consideration once both strands' base qualities pass `--min_bq`. If *both* strands agree on the same non-reference base, it is a double-strand candidate (`d`); if only one strand disagrees with the reference, the position is flagged as a single-strand mismatch (`m`). In addition to the `--min_depth` threshold, BiStro applies an automatic ceiling on coverage (4x the mean genome-wide callable coverage ) to avoid calling mutations in artefactually over-covered positions (likely the product of duplicated regions not annotated in the reference).
+
 | Flag | Default | Description |
 |---|---|---|
 | `-i, --bam` *(required)* | -- | BAM file with single-strand CCS reads aligned via `pbmm2 align --preset CCS`. |
@@ -98,20 +99,40 @@ Pre-processes single-strand CCS reads into candidate mutation calls.
 | `--check_mem_usage` | `10000` | Debug feature: how often (in processed ZMW duplexes) to check memory usage. `0` disables the check. |
 | `--do_not_collapse` | `True` | Debug feature: report mutations at the read level without collapsing to ZMW duplexes. |
 
-In addition to the minimum-depth constraint `--min-depth`, BiStro applies a cap to the maximum depth allowed, computed as 4 times the average genome coverage.
-
 <br>
 
-**Output:**
+### Output:
 * `{sample}.muts.bed.gz`: intermediate BED file containing putative single-nucleotide mutations. See the file header for more information regarding its content.
 * `{sample}.context.bed.gz`: intermediate BED file reporting the trinucleotide type and coverage for each 1-bp position interrogated by BiStro. Needed to compute the somatic mutation rate in the following step.
 * `{sample}_coverage_report.tsv`: report of genome coverage per contig/chromosome.
 * `{sample}.report.txt`: summary of the preprocessing step.
 
+<br>
   
 ### `bistro somatic`
 
 Calls true somatic mutations and per-sample mutation rates from pre-processed candidate calls across samples. 
+
+**How it works:** True somatic mutations are private to the sample they arose
+in and typically sit at low variant allele frequency, unlike germline
+variants, which are shared identically across every sample from the same
+individual/cell-line. BiStro exploits exactly this by requiring multiple samples as
+input: it intersects every sample's callable context to the genomic space
+observable in *all* samples simultaneously, so mutation rates end up compared
+on a common denominator. Each sample's DNM candidates are then checked
+against the others' candidate calls at the same position: a DNM recurring
+in `--thr` or more other samples is recurrent enough to be germline, not
+somatic, and gets reclassified `GRM`. As a first artefact filter, any
+duplex carrying more than `--max_muts_per_duplex` DNM calls is flagged `FPD`
+(false-positive de novo), since a single molecule with several independent de
+novo substitutions is far more likely to be a chimeric or mis-mapped read
+than genuine hypermutation. Finally, if `--bams` is supplied, BiStro pileups
+each surviving DNM's ALT allele directly in the *other* samples' raw BAMs: if `--min_alt_support` or more reads
+carry that allele at `--min_mapq` / `--min_baseq` in enough other samples,
+the call is also reflagged `FPD`, catching germline variants that a
+sample's own `preprocess` step happened to miss. What survives all three
+checks becomes the numerator of a Poisson mutation-rate estimate over the
+shared callable base pairs (95% CI via the exact chi-squared method).
 
 | Flag | Default | Description |
 |---|---|---|
@@ -120,18 +141,41 @@ Calls true somatic mutations and per-sample mutation rates from pre-processed ca
 | `--max_muts_per_duplex` | `5` | Maximum number of DNMs allowed per ZMW duplex; duplexes exceeding this are flagged FPD (false positive de novo). |
 | `--ref` *(required)* | -- | Reference genome FASTA file (indexed), used to determine the chromosome list. |
 | `--bams` | `None` | Indexed BAM file per sample, in the **same order** as `-i`. Enables the final safeguard: a de novo mutation whose ALT allele is supported by reads in other samples' BAMs is re-flagged FPD. Omit to skip the check. |
-| `--min_alt_support` | `1` | Minimum number of ALT alleles found during the pielup safeguard in another sample's BAM to count as supporting that allele. |
+| `--min_alt_support` | `1` | Minimum number of ALT alleles found during the pileup safeguard in another sample's BAM to count as supporting that allele. |
 | `--min_mapq` | `30` | Minimum mapping quality for a read to be counted in the `--bams` pileup safeguard. |
 | `--min_baseq` | `70` | Minimum base quality for a base to be counted in the `--bams` pileup safeguard. |
 | `-t, --threads` | `1` | Number of parallel worker processes. |
 
 <br>
 
-**Output:**
+### Output:
+* `{sample}.shared.muts.bed.gz`: candidate calls restricted to the cross-sample shared callable space. See the file's header for more information about its content.
+* `{sample}.shared.context.bed.gz`: callable-base track restricted to the same cross-sample shared space: the mutation-rate denominator.
+* `{sample1}_{sample2}_..._mutation_rates.tsv`: one row per sample with the somatic mutation rate, its Poisson 95% confidence interval, the DNM count (numerator), and the callable base pairs (denominator).
+
+>[!NOTE]
+>Because with a single `-i` file there is no other sample to intersect against, we strongly recommend running multiple samples together.
+
+<br> 
 
 ### `bistro sbs96`
 
 Corrects the somatic SBS96 spectrum for trinucleotide opportunity biases.
+
+**How it works:** Raw DNM counts, binned into the 96 pyrimidine-centred
+substitution contexts, are biased by how deeply CCS reads happened to sample
+each trinucleotide context. BiStro corrects
+this with `normcount = count * freq_G(c) / freq_C(c)`, where `G(c)` is the
+whole-genome trinucleotide composition (from a full scan of `--ref`, or a
+hardcoded table via `--preset_genome`) and `C(c)` is this sample's own
+depth-weighted callable trinucleotide count from the shared context track. A
+context sequenced deeper than its genome share is scaled down, one sequenced
+shallower is scaled up, so the corrected spectrum approximates what would
+have been observed had every context been sampled in proportion to its share
+of the genome. The same correction is computed a second time against a fixed
+GRCh38 composition. Trinucleotides that were barely covered in a given sample are unreliable to correct (a tiny `freq_C(c)` blows up the
+ratio), so any context whose `freq_G(c) / freq_C(c)` exceeds 4x the sample's own median ratio
+is masked to zero rather than left to dominate the spectrum.
 
 | Flag | Default | Description |
 |---|---|---|
@@ -143,7 +187,15 @@ Corrects the somatic SBS96 spectrum for trinucleotide opportunity biases.
 | `--plot` | `None` | Output SBS96 spectrum image (PDF/PNG). Defaults to `--out` with its extension replaced by `.pdf`. |
 | `-s, --sample` | `None` | Sample name for the plot title. Defaults to the `--out` basename. |
 | `--no_plot` | *(flag)* | Write only the TSV; skip the spectrum image. |
-| `-t, --threads` | `1` | Worker processes for the shared-context scan (one contig per worker). |
+| `-t, --threads` | `1` |  Number of parallel worker processes. |
+
+<br>
+
+### Output:
+* `{sample}.normcounts.tsv`): one row per SBS96 category, with the raw counts, this-sample-corrected `normcounts`/`normfrac`, human-composition-corrected `Human_normcounts`/`Human_normfrac`, and the underlying `freq_C(c)`/`freq_G(c)` diagnostics.
+* `{sample}.normcounts.pdf`: SBS96 spectrum bar plot, colour-grouped by substitution type.
+
+<br> 
 
 ### `bistro cosmic`
 
@@ -151,20 +203,34 @@ Computes the cosine similarity of a BiStro SBS96 spectrum against COSMIC signatu
 
 | Flag | Default | Description |
 |---|---|---|
-| `-i, --input` *(required)* | -- | `SAMPLE.normcounts.tsv` produced by `sbs96`. |
+| `-i, --input` *(required)* | -- | `{sample}.normcounts.tsv` produced by `sbs96`. |
 | `--sign_file` | bundled COSMIC v3.6 GRCh38 | COSMIC SBS96 signature file (SigProfiler `Type\tSBS1\tSBS2...` layout). |
 | `--signatures` | `None` (every signature) | Optional subset of signatures to compare against, e.g. `--signatures SBS1 SBS5 SBS40`. |
-| `--column` | `Human_normfrac` | `normcounts.tsv` column to use as the sample spectrum -- `Human_normfrac` is the spectrum corrected on human-genome opportunity, which is what COSMIC signatures are defined on. |
+| `--column` | `Human_normfrac` | `{sample}.normcounts.tsv` column to use as the sample spectrum. |
 | `-o, --out` | `None` (stdout) | Output TSV. |
 | `--top` | `None` | Report only the N best-matching signatures. |
+
+<br>
+
+### Output:
+* `{--out}`: a two-column table, `signature` and `cosine_similarity`, one row per COSMIC signature compared, sorted from best to worst match.
+
+<br>
 
 ## Running the full pipeline with Snakemake
 
 The `workflow/` directory holds a Snakemake pipeline that runs all four stages
 (plus an optional DeepVariant germline-calling step) across every sample listed
-in a samples TSV, ending in a per-sample COSMIC cosine-similarity table.
+in a samples TSV. The TSV must be formatted as {path_to_bam}\t{sample}, as shown [here](xxxxxxxx).
 
-1. Copy the template config and fill in your paths:
+The DeepVariant step feeds `bistro preprocess --germline_vcf`, but since
+`bistro somatic` already reclassifies any DNM recurring across samples as
+germline (see [`bistro somatic`](#bistro-somatic) above), it is redundant for
+the multi-sample use case the pipeline is built around; we don't recommend
+enabling it. It remains useful only if you need calls for a single sample with
+no other samples to cross-check against.
+
+1. Copy the template config and **fill in your paths and parameters**:
    ```bash
    cp config/config.yaml config/my_run.yaml
    ```
@@ -177,11 +243,7 @@ in a samples TSV, ending in a per-sample COSMIC cosine-similarity table.
    ```bash
    sbatch workflow/main_Snakemake.sh my_run config/my_run.yaml
    ```
-
-`workflow/scripts/get_human_trinuc.py` is a standalone helper for regenerating
-the whole-genome trinucleotide composition table used by the `sbs96` correction,
-should you need it for a genome build other than the ones already hardcoded in
-`normcountlib.py`.
+<br>
 
 ## Reference data and Testing
 
@@ -191,12 +253,11 @@ BiStro comes with COSMIC v3.6 SBS signature files (`GRCh38` and `mm10`) used as
 the default input to `bistro cosmic`. Override with `--sign_file` for another
 COSMIC release or genome build.
 
+<br>
+
 ## Citation
 
 If you use BiStro in your work, please cite it:
 
 > Zafferani, P. BiStro (2026). https://github.com/Zaffe24/BiStro
 
-Machine-readable citation metadata is provided in [CITATION.cff](CITATION.cff)
-(GitHub surfaces this automatically via the "Cite this repository" button on
-the repo's main page).
