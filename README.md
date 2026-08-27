@@ -26,6 +26,8 @@ To discriminate between germline and *de novo* mutations (DNMs), BiStro relies o
 
 ## Installation
 
+Requires **Python >= 3.12**.
+
 ```bash
 git clone https://github.com/Zaffe24/BiStro.git
 cd BiStro
@@ -33,19 +35,11 @@ conda env create -f environment.yml
 conda activate bistro
 ```
 
-This installs BiStro itself (in editable mode) plus its Python dependencies
-(`pysam`, `pandas`, `numpy`, `scipy`, `matplotlib`, `psutil`) and the external
-tools the Snakemake pipeline shells out to (`bgzip`, `tabix`, `snakemake`).
-
-Requires **Python >= 3.12**.
-
 Alternatively, install just the package with pip:
 
 ```bash
 pip install .
 ```
-
-Either way, this exposes a `bistro` command (equivalent to `python -m bistro`).
 
 ## Usage
 
@@ -54,21 +48,21 @@ BiStro has four subcommands, run in sequence:
 | Subcommand | Purpose |
 |---|---|
 | [`bistro preprocess`](#bistro-preprocess) | Pre-process single-strand CCS reads into candidate mutation calls. |
-| [`bistro somatic`](#bistro-somatic) | Call true somatic mutations and rates from pre-processed candidate calls across samples. |
-| [`bistro sbs96`](#bistro-sbs96) | Correct the somatic SBS96 spectrum for trinucleotide opportunity biases. |
-| [`bistro cosmic`](#bistro-cosmic) | Cosine similarity of a BiStro SBS96 spectrum against COSMIC signatures. |
+| [`bistro somatic`](#bistro-somatic) | Call true somatic mutations by interpolating preprocessed calls from all the samples run. |
+| [`bistro sbs96`](#bistro-sbs96) | Compute and correct the somatic SBS96 spectrum for trinucleotide opportunity biases. |
+| [`bistro cosmic`](#bistro-cosmic) | Cosine similarity against mutational signatures (e.g., COSMIC). |
 
-Run `bistro <subcommand> --help` at any time for this same information from the CLI itself.
+Run `bistro <subcommand> --help` at any time to expose the complete parameter list.
 
-### Example: single sample, by hand
+<br>
 
-```bash
-bistro preprocess --bam sample.bam --ref reference.fa.gz --out_dir out/ --sample S01
-bistro somatic -i out/S01.muts.bed.gz --bams sample.bam --ref reference.fa.gz
-bistro sbs96 --context out/S01.shared.context.bed.gz --muts out/S01.shared.muts.bed.gz \
-    --ref reference.fa.gz --out out/S01.normcounts.tsv
-bistro cosmic -i out/S01.normcounts.tsv --out out/S01.SBS_cosine_similarity.tsv
-```
+>[!IMPORTANT]
+> The current release of BiStro requires already mapped BAMs. To align unmapped BAMs, install `pbmm2` and run the following command:
+>```bash
+>pbmm2 align {genome.ref} {input.bam} {output.bam} --preset CCS --sort
+>```
+
+<br>
 
 ### `bistro preprocess`
 
@@ -78,45 +72,60 @@ Pre-processes single-strand CCS reads into candidate mutation calls.
 |---|---|---|
 | `-i, --bam` *(required)* | -- | BAM file with single-strand CCS reads aligned via `pbmm2 align --preset CCS`. |
 | `-r, --ref` *(required)* | -- | Reference genome FASTA file. |
-| `-g, --germline_vcf` | `None` | VCF file with germline mutations. Somatic mutations will not be called at these positions. |
-| `--min_gq` | `20` | Minimum Genotype Quality used to flag positions with germline variants. |
+| `-g, --germline_vcf` | `None` | (Deprecated) VCF file with germline mutations. Somatic mutations will not be called at these positions. |
+| `--min_gq` | `20` | (Deprecated) Minimum Genotype Quality used to flag positions with germline variants. |
 | `-o, --out_dir` *(required)* | -- | Output directory to write the results. |
 | `-s, --sample` | `TrySample` | Sample name to be used in the output files. |
+| `--low_complexity_regions` | `None` | BED file of intervals to exclude from the mutation and context outputs (e.g. repeat/low-complexity regions). |
 | `--region` | `""` | Target chromosome(s) to call mutations on, e.g. `chr1 chr2 chr3`. |
 | `--exclude` | `""` | Chromosome(s) to exclude from mutation calling, e.g. `chr1 chr2 chr3`. |
 | `-t, --threads` | `1` | Number of threads to use for parallel processing. |
 | `--min_mapq` | `60` | Minimum mapping quality score for reads to be considered. |
-| `--min_sequence_identity` | `0.99` | Minimum sequence identity threshold for reads to be considered. |
+| `--min_sequence_identity` | `0.99` | Minimum sequence identity to the template for reads to be considered. |
 | `--min_bq` | `93` | Minimum base quality score for both positions of a base pair to be considered. |
 | `--min_qlen` | `800` | Minimum read length for reads to be considered. |
 | `--max_qlen` | `10000` | Maximum read length for reads to be considered. |
 | `--min_depth` | `3` | Minimum read coverage to be considered. |
 | `--trim_ends` | `0.025` | Bases to trim from each read's ends. `< 1` is a proportion of read length; `>= 1` is an absolute base count. |
 | `--indels_window` | `10` | Window size for indel filtering: indels within this window around a candidate SBS are used to filter it out. |
-| `--mismatch_window_len` | `20` | Window size for mismatch filtering: mismatches within this window around a candidate variant are recorded. |
+| `--mismatch_window_len` | `20` | Window size for mismatch filtering: mutations falling within this window from a mismatch are flagged. |
 | `--min_ec` | `5` | Minimum effective coverage (EC) for a candidate variant to be considered. |
 | `--min_rq` | `0.99` | Minimum read quality (RQ) for reads to be considered. |
 | `--max_softclipping` | `0.2` | Maximum proportion of soft-clipped bases allowed in a read. |
 | `--z_prob` | `0` | Debug feature: set to `1000000` to randomly record a reference base pair with probability 1/1000000, for error-model estimation. `0` disables it. |
-| `--check_mem_usage` | `10000` | How often (in processed ZMW duplexes) to check memory usage. `0` disables the check. |
-| `--do_not_collapse` | `True` | Report mutations at the read level without collapsing to ZMW duplexes. Useful for debugging and error-model estimation. |
-| `--low_complexity_regions` | `None` | BED file of intervals to exclude from the mutation and context outputs (e.g. repeat/low-complexity regions). |
+| `--check_mem_usage` | `10000` | Debug feature: how often (in processed ZMW duplexes) to check memory usage. `0` disables the check. |
+| `--do_not_collapse` | `True` | Debug feature: report mutations at the read level without collapsing to ZMW duplexes. |
 
+In addition to the minimum-depth constraint `--min-depth`, BiStro applies a cap to the maximum depth allowed, computed as 4 times the average genome coverage.
+
+<br>
+
+**Output:**
+* `{sample}.muts.bed.gz`: intermediate BED file containing putative single-nucleotide mutations. See the file header for more information regarding its content.
+* `{sample}.context.bed.gz`: intermediate BED file reporting the trinucleotide type and coverage for each 1-bp position interrogated by BiStro. Needed to compute the somatic mutation rate in the following step.
+* `{sample}_coverage_report.tsv`: report of genome coverage per contig/chromosome.
+* `{sample}.report.txt`: summary of the preprocessing step.
+
+  
 ### `bistro somatic`
 
-Calls true somatic mutations and per-sample mutation rates from pre-processed candidate calls, across samples.
+Calls true somatic mutations and per-sample mutation rates from pre-processed candidate calls across samples. 
 
 | Flag | Default | Description |
 |---|---|---|
-| `-i` *(required)* | -- | One or more `.muts.bed.gz` files produced by `preprocess`. |
+| `-i` *(required)* | -- | Series of `.muts.bed.gz` files produced by `preprocess`. |
 | `--thr` | `1` | Minimum number of *other* samples that must show a mutation before it stops being treated as private -- either by carrying a call at that position (annotated germline), or, when `--bams` is given, by carrying read support for its ALT allele (annotated FPD). |
-| `--max_muts_per_duplex` | `2` | Maximum number of DNMs allowed per ZMW duplex; duplexes exceeding this are flagged FPD (false positive de novo). |
+| `--max_muts_per_duplex` | `5` | Maximum number of DNMs allowed per ZMW duplex; duplexes exceeding this are flagged FPD (false positive de novo). |
 | `--ref` *(required)* | -- | Reference genome FASTA file (indexed), used to determine the chromosome list. |
 | `--bams` | `None` | Indexed BAM file per sample, in the **same order** as `-i`. Enables the final safeguard: a de novo mutation whose ALT allele is supported by reads in other samples' BAMs is re-flagged FPD. Omit to skip the check. |
-| `--min_alt_support` | `1` | Minimum number of high-quality reads carrying the ALT allele for another sample's BAM to count as supporting that allele. |
+| `--min_alt_support` | `1` | Minimum number of ALT alleles found during the pielup safeguard in another sample's BAM to count as supporting that allele. |
 | `--min_mapq` | `30` | Minimum mapping quality for a read to be counted in the `--bams` pileup safeguard. |
 | `--min_baseq` | `70` | Minimum base quality for a base to be counted in the `--bams` pileup safeguard. |
 | `-t, --threads` | `1` | Number of parallel worker processes. |
+
+<br>
+
+**Output:**
 
 ### `bistro sbs96`
 
@@ -172,10 +181,12 @@ the whole-genome trinucleotide composition table used by the `sbs96` correction,
 should you need it for a genome build other than the ones already hardcoded in
 `normcountlib.py`.
 
-## Reference data
+## Reference data and Testing
 
-BiStro ships with COSMIC v3.6 SBS signature files (`GRCh38` and `mm10`) used as
-the default input to `bistro cosmic`; override with `--sign_file` for another
+A dummy dataset comprising small genomic fractions of samples `E01`-`F01` and a FASTA genome snippet is present in `tests/data` for testing the pipeline.
+
+BiStro comes with COSMIC v3.6 SBS signature files (`GRCh38` and `mm10`) used as
+the default input to `bistro cosmic`. Override with `--sign_file` for another
 COSMIC release or genome build.
 
 ## Citation
