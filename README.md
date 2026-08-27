@@ -221,7 +221,7 @@ Computes the cosine similarity of a BiStro SBS96 spectrum against COSMIC signatu
 
 The `workflow/` directory holds a Snakemake pipeline that runs all four stages
 (plus an optional DeepVariant germline-calling step) across every sample listed
-in a samples TSV. The TSV must be formatted as {path_to_bam}\t{sample}, as shown [here](xxxxxxxx).
+in a samples TSV. The TSV must be formatted as {path_to_bam}\t{sample}, as shown [here](https://github.com/Zaffe24/BiStro/blob/main/tests/data/example_input.tsv).
 
 The DeepVariant step feeds `bistro preprocess --germline_vcf`, but since
 `bistro somatic` already reclassifies any DNM recurring across samples as
