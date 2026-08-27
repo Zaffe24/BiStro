@@ -38,6 +38,8 @@ conda activate bistro
 Alternatively, install just the package with pip:
 
 ```bash
+git clone https://github.com/Zaffe24/BiStro.git
+cd BiStro
 pip install .
 ```
 
