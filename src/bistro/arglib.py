@@ -247,7 +247,7 @@ def parse_args(program_version, arguments=sys.argv[1:]):
         required=True,
         nargs="+",
         metavar="BED",
-        help="One or more .muts.bed.gz files produced by the 'preprocess' subcommand.",
+        help="Series of .muts.bed.gz files produced by the 'preprocess' subcommand.",
     )
     parser_somatic.add_argument(
         "--thr",
@@ -260,7 +260,7 @@ def parse_args(program_version, arguments=sys.argv[1:]):
         "--max_muts_per_duplex",
         type=int,
         required=False,
-        default=2,
+        default=5,
         help="Maximum number of DNMs allowed per ZMW duplex. ZMWs exceeding this threshold are flagged as FPD (false positive de novo).",
     )
     parser_somatic.add_argument(

@@ -10,3 +10,4 @@ snk_logs/
 *.log
 
 .env
+tests/run_smoke_test.sh
