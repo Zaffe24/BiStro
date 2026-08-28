@@ -1,7 +1,7 @@
 # ---------------------------------------------------------------------------
 # BiStro Snakemake pipeline configuration (template).
 # Copy this file, fill in your own paths, and pass it to Snakemake with
-# --configfile (see workflow/README or main_Snakemake.sh).
+# --configfile (see main_Snakemake.sh).
 # ---------------------------------------------------------------------------
 
 input:
