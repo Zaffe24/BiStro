@@ -30,8 +30,25 @@ COSMIC signatures are defined on human-genome opportunity, so Human_normfrac is
 the column to fit against them; normfrac stays on this sample's own genome.
 
 The position-unique callable count R(c) — each callable position counted once,
-regardless of depth — no longer enters the correction, but is still reported as
-the ref_callable_tri_count column for diagnostics.
+regardless of depth — is still reported as the ref_callable_tri_count column for
+diagnostics.
+
+An alternative freq_G(c) is also computed and reported alongside the genome one
+(the normcounts_new / normfrac_new / freq_G(c)_new columns):
+
+        normcount_new = count * freq_G_new(c) / freq_C(c)
+
+where freq_G_new(c) is the position-unique callable composition — R(c), each
+callable position in shared.context.bed.gz counted once regardless of depth,
+divided by its sum over the 32 contexts. This rescales the spectrum to the
+composition of the *callable* genome rather than the whole reference. No
+human-opportunity variant is produced for this method. The coverage mask (below)
+is reused unchanged: it flags contexts whose freq_C is too low to trust, which
+does not depend on the freq_G target.
+
+The freq_G/freq_C(c) and freq_G/freq_C(c)_new columns report the per-context
+correction factor freq_G(c)/freq_C(c) for the genome method and the alternative
+method respectively.
 
 A context this sample barely covered (freq_C(c) near zero) makes freq_G/freq_C
 huge, so even a single raw count there gets amplified into an outsized,
@@ -447,12 +464,39 @@ def dump_normcounts(sbs96_counts, sbs96_lst, sbs96_to_tri,
         sbs96_counts, sbs96_lst, sbs96_to_tri, ccs_freq, human_freq, masked
     )
 
+    # ---- Alternative freq_G: position-unique callable composition ----
+    # freq_G(c)_new is built from R(c) — each callable position in
+    # shared.context.bed.gz counted exactly once, depth ignored (ref_callable) —
+    # instead of the whole-reference trinucleotide composition. It asks what the
+    # spectrum would look like had the reads sampled every context in proportion
+    # to how much callable sequence that context covers. No human-composition
+    # variant is computed for this method; the same coverage mask is reused.
+    ref_freq = get_trifreq(ref_callable)
+    new_normcounts, new_normfracs = apply_correction(
+        sbs96_counts, sbs96_lst, sbs96_to_tri, ccs_freq, ref_freq, masked
+    )
+
+    # Per-context correction factor freq_G(c)/freq_C(c) for each method, reported
+    # as its own column. Undefined where the context has no read-weighted
+    # coverage (freq_C == 0); written as 0.0 there, matching how those contexts
+    # are already zeroed in normcounts.
+    ratio_gc = {
+        tri: (genome_freq[tri] / ccs_freq[tri] if ccs_freq[tri] > 0 else 0.0)
+        for tri in genome
+    }
+    ratio_gc_new = {
+        tri: (ref_freq[tri] / ccs_freq[tri] if ccs_freq[tri] > 0 else 0.0)
+        for tri in genome
+    }
+
     # Write the table now that the fraction denominators are known.
     with open(out_file, "w") as o:
         o.write(cmdline + "\n")
         o.write("\t".join([
             "sub", "tri", "sbs96", "counts", "frac", "normcounts", "normfrac",
-            "freq_C(c)", "freq_G(c)",
+            "normcounts_new", "normfrac_new",
+            "freq_C(c)", "freq_G(c)", "freq_G(c)_new",
+            "freq_G/freq_C(c)", "freq_G/freq_C(c)_new",
             "genome_tri_count", "ref_callable_tri_count", "duplex_callable_tri_count",
             "Human_normcounts", "Human_normfrac", "freq_G_human", "human_tri_count",
             "masked",
@@ -464,7 +508,9 @@ def dump_normcounts(sbs96_counts, sbs96_lst, sbs96_to_tri,
             sub = "{}>{}".format(sbs96[2], sbs96[4])
             o.write("\t".join(str(x) for x in [
                 sub, tri, sbs96, sbs96_counts[sbs96], counts_freq[sbs96], normcounts[sbs96], normfracs[sbs96],
-                ccs_freq[tri], genome_freq[tri],
+                new_normcounts[sbs96], new_normfracs[sbs96],
+                ccs_freq[tri], genome_freq[tri], ref_freq[tri],
+                ratio_gc[tri], ratio_gc_new[tri],
                 genome[tri], ref_callable[tri], ccs_callable[tri],
                 human_normcounts[sbs96], human_normfracs[sbs96],
                 human_freq[tri], HUMAN_TRINUC_COUNT[tri],
