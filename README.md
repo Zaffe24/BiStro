@@ -260,4 +260,3 @@ COSMIC release or genome build.
 If you use BiStro in your work, please cite it:
 
 > Zafferani, P. BiStro (2026). https://github.com/Zaffe24/BiStro
-
