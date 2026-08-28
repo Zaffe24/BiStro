@@ -79,7 +79,7 @@ Pre-processes single-strand CCS reads into candidate mutation calls.
 | `--min_gq` | `20` | (Deprecated) Minimum Genotype Quality used to flag positions with germline variants. |
 | `-o, --out_dir` *(required)* | -- | Output directory to write the results. |
 | `-s, --sample` | `TrySample` | Sample name to be used in the output files. |
-| `--low_complexity_regions` | `None` | BED file of intervals to exclude from the mutation and context outputs (e.g. repeat/low-complexity regions). |
+| `--low_complexity_regions` | `None` | BED file of intervals to exclude from the mutation and context outputs (e.g. repeat/low-complexity regions). See `scripts/create_lcr_bed.sh` |
 | `--region` | `""` | Target chromosome(s) to call mutations on, e.g. `chr1 chr2 chr3`. |
 | `--exclude` | `""` | Chromosome(s) to exclude from mutation calling, e.g. `chr1 chr2 chr3`. |
 | `-t, --threads` | `1` | Number of threads to use for parallel processing. |
@@ -232,16 +232,17 @@ no other samples to cross-check against.
 
 1. Copy the template config and **fill in your paths and parameters**:
    ```bash
-   cp config/config.yaml config/my_run.yaml
+   cp workflow/config.yaml workflow/my_run.yaml
    ```
 2. Run it directly:
    ```bash
-   snakemake --snakefile workflow/Snakefile --configfile config/my_run.yaml --cores 8
+   snakemake --snakefile workflow/Snakefile --configfile workflow/my_run.yaml --cores 8
    ```
    or, on a SLURM cluster, adapt and submit `workflow/main_Snakemake.sh` (written
    for CESGA; update the module/conda activation lines for your own cluster):
    ```bash
-   sbatch workflow/main_Snakemake.sh my_run config/my_run.yaml
+   cd workflow
+   sbatch main_Snakemake.sh my_run my_run.yaml
    ```
 <br>
 

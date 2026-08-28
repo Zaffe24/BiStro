@@ -1,11 +1,11 @@
 #!/bin/bash
 # Example SLURM submission script (written for CESGA -- adapt module/conda
 # names to your own cluster). Replace --mail-user with your own address.
-#SBATCH --mail-type=ALL
-#SBATCH --mail-user=you@example.com
+#SBATCH --mail-type=fail,end
+#SBATCH --mail-user=pietro.zaffe@gmail.com
 #SBATCH --job-name=Snk_BiStro
-#SBATCH --error=snk_logs/snk_BiStro_%j.err
-#SBATCH --output=snk_logs/snk_BiStro_%j.err
+#SBATCH --error=snk_BiStro_%j.err
+#SBATCH --output=snk_BiStro_%j.err
 #SBATCH --partition=long
 #SBATCH --mem=2000
 #SBATCH --cpus-per-task=1
