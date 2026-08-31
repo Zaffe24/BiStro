@@ -7,7 +7,7 @@
 #SBATCH --error=snk_BiStro_%j.err
 #SBATCH --output=snk_BiStro_%j.err
 #SBATCH --partition=long
-#SBATCH --mem=2000
+#SBATCH --mem=1000
 #SBATCH --cpus-per-task=1
 #SBATCH --time=48:00:00
 
