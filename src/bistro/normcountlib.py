@@ -46,7 +46,7 @@ human-opportunity variant is produced for this method. The coverage mask (below)
 is reused unchanged: it flags contexts whose freq_C is too low to trust, which
 does not depend on the freq_G target.
 
-The freq_G/freq_C(c) and freq_G/freq_C(c)_new columns report the per-context
+The freq_G/freq_C(c) and freq_G(c)_new/freq_C(c) columns report the per-context
 correction factor freq_G(c)/freq_C(c) for the genome method and the alternative
 method respectively.
 
@@ -496,7 +496,7 @@ def dump_normcounts(sbs96_counts, sbs96_lst, sbs96_to_tri,
             "sub", "tri", "sbs96", "counts", "frac", "normcounts", "normfrac",
             "normcounts_new", "normfrac_new",
             "freq_C(c)", "freq_G(c)", "freq_G(c)_new",
-            "freq_G/freq_C(c)", "freq_G/freq_C(c)_new",
+            "freq_G/freq_C(c)", "freq_G(c)_new/freq_C(c)",
             "genome_tri_count", "ref_callable_tri_count", "duplex_callable_tri_count",
             "Human_normcounts", "Human_normfrac", "freq_G_human", "human_tri_count",
             "masked",
