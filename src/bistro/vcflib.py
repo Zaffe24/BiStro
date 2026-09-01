@@ -119,7 +119,7 @@ def write_context_one(path, contig, start, end, depth, reference, min_depth, max
     """Write one contig's per-position context as a headerless bgzf fragment."""
     if min_depth >= max_depth:
         raise ValueError(f"Minimum depth threshold ({min_depth}) cannot be higher than maximum threhsold ({max_depth})")
-        utilib.exit()
+        utilib.exit(1)
     with pysam.FastaFile(reference) as fasta, \
          pysam.BGZFile(path, "wb") as bed:
         ref_seq = fasta.fetch(contig).upper()
