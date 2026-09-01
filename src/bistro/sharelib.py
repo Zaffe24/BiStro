@@ -514,7 +514,7 @@ def main(all_muts, thr_shared, max_muts_per_duplex, nproc, reference,
     bams = bams or []
     if bams and len(bams) != len(all_muts):
         utilib.cprint(f"ERROR: --bams has {len(bams)} file(s) but -i has {len(all_muts)}; they must match in number and order.", color="red")
-        utilib.exit()
+        utilib.exit(1)
     bam_by_mut = dict(zip(all_muts, bams))
 
     if len(all_muts)<2:

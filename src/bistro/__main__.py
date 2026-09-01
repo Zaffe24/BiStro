@@ -92,7 +92,7 @@ def main():
     else:
         print(f"Command 'BiStro {options.sub}' does not exist!\n")
         parser.print_help()
-        utilib.exit()
+        utilib.exit(1)
 
 
 if __name__ == "__main__":
