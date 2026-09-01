@@ -261,11 +261,19 @@ def call_somatic_mutations(region_tuple,
 def write_frags(mut_list, ctx_list, region_tuple, reference, out_dir, sample, min_depth, max_depth):
 
     CONTIG, START, END = region_tuple
+    cap = max_depth[CONTIG] if isinstance(max_depth, dict) else max_depth
     mut_frag = os.path.join(out_dir, f"{sample}.muts.{CONTIG}.frag.bgz")
     ctx_frag = os.path.join(out_dir, f"{sample}.context.{CONTIG}.frag.bgz")
 
-    vcflib.write_mut_one(mut_frag, mut_list, min_depth, max_depth)
-    vcflib.write_context_one(ctx_frag, CONTIG, START, END, ctx_list, reference, min_depth, max_depth)
+    if cap is None:
+        # mean duplex coverage on this contig is below min_depth: emit nothing
+        for frag in (mut_frag, ctx_frag):
+            with pysam.BGZFile(frag, "wb"):
+                pass
+        return mut_frag, ctx_frag
+
+    vcflib.write_mut_one(mut_frag, mut_list, min_depth, cap)
+    vcflib.write_context_one(ctx_frag, CONTIG, START, END, ctx_list, reference, min_depth, cap)
 
     return mut_frag, ctx_frag
 
@@ -344,7 +352,12 @@ def main(bam,
     
     del results
 
-    max_thr = reportlib.get_maximum_coverage(merged_report.callable_bps, merged_report.total_length_ref)
+    max_thr = reportlib.get_maximum_coverage_per_contig(
+        merged_report.callable_bps,
+        merged_report.total_length_ref,
+        merged_report.chrom_name,
+        min_depth=min_depth,
+    )
     
     worker2 = partial(write_frags,
                       min_depth = min_depth,
@@ -364,7 +377,8 @@ def main(bam,
     # ---- assemble outputs from the per-contig fragments ----
     # mut-bed: prepend the shared header, concat fragments (no tabix, matching write_mut_bed).
     mut_file = os.path.join(out_dir, f"{sample}.muts.bed.gz")
-    mut_header = "\n".join(vcflib.mut_bed_header(sample, reference, merged_report.filtering_params + (max_thr,) ))
+    max_depth_hdr = "per-contig:mean+4*sqrt(mean)" if isinstance(max_thr, dict) else max_thr
+    mut_header = "\n".join(vcflib.mut_bed_header(sample, reference, merged_report.filtering_params + (max_depth_hdr,) ))
     uno = time.time() / 60
     vcflib.finalize_bgzf(mut_file, mut_header, mut_frags, tabix_bed=False)
     dos = time.time() / 60
@@ -374,11 +388,11 @@ def main(bam,
 
 
     vcflib.write_report(out_dir, sample, merged_report)
-    vcflib.write_merged_coverages(merged_report, out_dir, sample)
+    vcflib.write_merged_coverages(merged_report, out_dir, sample, max_depth=max_thr)
 
     # context: single-line header, concat fragments, then tabix-index.
     context_file = os.path.join(out_dir, f"{sample}.context.bed.gz")
-    header_ctx = f"##Minimum depth: {min_depth}; Maximum depth (AVG+4√AVG): {max_thr}\n##CONTIG\tSTART\tEND\tREF\tDEPTH\n"
+    header_ctx = f"##Minimum depth: {min_depth}; Maximum depth: per-contig mean+4*sqrt(mean) (duplex scale)\n##CONTIG\tSTART\tEND\tREF\tDEPTH\n"
     uno = time.time() / 60
     vcflib.finalize_bgzf(context_file, header_ctx, ctx_frags, tabix_bed=True)
     dos = time.time() / 60

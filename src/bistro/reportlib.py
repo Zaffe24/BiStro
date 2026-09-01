@@ -111,9 +111,38 @@ def get_coverage(callable_bps, total_length_ref):
 
 def get_maximum_coverage(callable_bps, total_length_ref):
     mean_cov = get_coverage(callable_bps, total_length_ref)
-        
-    return round( mean_cov * 4, 2)
-    #return round( mean_cov + (4 * np.sqrt(mean_cov)), 2)
 
-    ##debugging 
-    #return 1000
+    return round(mean_cov + (4 * np.sqrt(mean_cov)), 2)
+
+
+def get_maximum_coverage_per_contig(callable_bps, total_length_ref, chrom_name,
+                                    min_depth=0, sigma=4):
+    """Per-contig max-depth cap on the duplex-pair scale of BiStro's DEPTH.
+
+    For each contig: m = callable_bps_c / total_length_ref_c (mean duplex
+    coverage, as reported in {sample}_coverage_report.tsv), and
+    cap = round(m + sigma*sqrt(m), 2), clamped to > min_depth (mirrors HiDef's
+    `if high_thresh <= min_cov: high_thresh = min_cov + 1`).
+
+    A contig whose mean duplex coverage is below min_depth is mapped to None:
+    no mutations or context are emitted for it at all.
+
+    Args are the per-contig lists produced by merge_reports(). Returns
+    {contig: cap|None}; contigs with zero reference length fall back to the
+    genome-wide value.
+    """
+    caps = {}
+    gw = get_maximum_coverage(callable_bps, total_length_ref)
+    for bps, length, chrom in zip(callable_bps, total_length_ref, chrom_name):
+        if length <= 0:
+            caps[chrom] = gw
+            continue
+        m = bps / length
+        if m < min_depth:
+            caps[chrom] = None
+            continue
+        cap = round(m + sigma * np.sqrt(m), 2)
+        if cap <= min_depth:
+            cap = min_depth + 1
+        caps[chrom] = cap
+    return caps

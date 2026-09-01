@@ -88,18 +88,25 @@ def write_report(dir, sample, report):
     utilib.cprint(f"Somatic Mutation Calling report saved to: {os.path.basename(txtF)} {os.path.basename(jsonF)}")
 
 
-def write_merged_coverages(merged, out_dir, sample):
+def write_merged_coverages(merged, out_dir, sample, max_depth=None):
     file_name = os.path.join(out_dir, f"{sample}_coverage_report.tsv")
     lengths = merged.total_length_ref
     callable = merged.callable_bps
     chroms = merged.chrom_name
 
     with open(file_name, "w") as f:
-        f.write("## CHROM\tLENGTH\tCALLABLE_BPS\tCOVERAGE\tINCLUDED\n")
+        f.write("## CHROM\tLENGTH\tCALLABLE_BPS\tCOVERAGE\tMAX_DEPTH\n")
         for n, c in enumerate(chroms):
             coverage = round(callable[n]/lengths[n],2) if lengths[n] > 0 else 0
-            #f.write(f"{c}\t{lengths[n]}\t{callable[n]}\t{coverage}\t{"PASS" if lengths[n]>= min_chr_len and callable[n] > 0 else "NO" }\n")
-            f.write(f"{c}\t{lengths[n]}\t{callable[n]}\t{coverage}\n")
+            if isinstance(max_depth, dict):
+                cap = max_depth.get(c, "")
+                if cap is None:
+                    cap = "EXCLUDED"
+            elif max_depth is not None:
+                cap = max_depth
+            else:
+                cap = ""
+            f.write(f"{c}\t{lengths[n]}\t{callable[n]}\t{coverage}\t{cap}\n")
     
     utilib.cprint(f"Report of Chromosome Coverages saved to: {os.path.basename(file_name)}")
 
