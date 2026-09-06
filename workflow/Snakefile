@@ -12,7 +12,6 @@
 # ---------------------------------------------------------------------------
 
 # No hardcoded default: always invoke with --configfile pointing at your copy
-# of config/config.yaml (see main_Snakemake.sh for an example).
 
 import csv
 import os

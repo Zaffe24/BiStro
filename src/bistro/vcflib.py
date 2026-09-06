@@ -88,61 +88,67 @@ def write_report(dir, sample, report):
     utilib.cprint(f"Somatic Mutation Calling report saved to: {os.path.basename(txtF)} {os.path.basename(jsonF)}")
 
 
-def write_merged_coverages(merged, out_dir, sample, max_depth=None):
+def write_merged_coverages(merged, out_dir, sample, raw_means=None, max_depth=None):
     file_name = os.path.join(out_dir, f"{sample}_coverage_report.tsv")
     lengths = merged.total_length_ref
     callable = merged.callable_bps
     chroms = merged.chrom_name
+    raw_means = raw_means or {}
+    max_depth = max_depth or {}
 
     with open(file_name, "w") as f:
-        f.write("## CHROM\tLENGTH\tCALLABLE_BPS\tCOVERAGE\tMAX_DEPTH\n")
+        f.write("## DUPLEX_COVERAGE = CALLABLE_BPS / LENGTH (mean BiStro duplex depth).\n")
+        f.write("## RAW_COVERAGE   = mean raw-read depth from mosdepth, MAPQ>=20.\n")
+        f.write("## MAX_DEPTH      = round(RAW_COVERAGE + 4*sqrt(RAW_COVERAGE)); reference\n")
+        f.write("##   intervals whose raw depth reached this were removed from the\n")
+        f.write("##   .muts.bed.gz / .context.bed.gz outputs.\n")
+        f.write("## CHROM\tLENGTH\tCALLABLE_BPS\tDUPLEX_COVERAGE\tRAW_COVERAGE\tMAX_DEPTH\n")
         for n, c in enumerate(chroms):
-            coverage = round(callable[n]/lengths[n],2) if lengths[n] > 0 else 0
-            if isinstance(max_depth, dict):
-                cap = max_depth.get(c, "")
-                if cap is None:
-                    cap = "EXCLUDED"
-            elif max_depth is not None:
-                cap = max_depth
-            else:
-                cap = ""
-            f.write(f"{c}\t{lengths[n]}\t{callable[n]}\t{coverage}\t{cap}\n")
+            dup = round(callable[n]/lengths[n],2) if lengths[n] > 0 else 0
+            f.write(f"{c}\t{lengths[n]}\t{callable[n]}\t{dup}"
+                    f"\t{raw_means.get(c, '')}\t{max_depth.get(c, '')}\n")
     
     utilib.cprint(f"Report of Chromosome Coverages saved to: {os.path.basename(file_name)}")
 
 
-def write_mut_one(path, mut_list, min_depth, max_depth):
-    """Write one contig's mutations as a headerless bgzf fragment."""
+def write_mut_one(path, mut_list, min_depth):
+    """Write one contig's mutations as a headerless bgzf fragment.
+
+    Only the lower depth bound is enforced here; the per-contig maximum-depth
+    mask is applied afterwards on the assembled file (see covlib)."""
     with pysam.BGZFile(path, "wb") as bed:
         for mut in mut_list:
-            if mut[-1] >= min_depth and mut[-1] <= max_depth:
+            if mut[-1] >= min_depth:
                 str_mut = [str(x) for x in mut]
                 block1 = ":".join(str_mut[6:15])
                 block2 = ":".join(str_mut[15:24])
                 bed.write(("\t".join(x for x in (str_mut[:6]+[block1]+[block2]+str_mut[24:])) + "\n").encode())
 
 
-def write_context_one(path, contig, start, end, depth, reference, min_depth, max_depth):
-    """Write one contig's per-position context as a headerless bgzf fragment."""
-    if min_depth >= max_depth:
-        raise ValueError(f"Minimum depth threshold ({min_depth}) cannot be higher than maximum threhsold ({max_depth})")
-        utilib.exit(1)
+def write_context_one(path, contig, start, end, depth, reference, min_depth):
+    """Write one contig's per-position context as a headerless bgzf fragment.
+
+    Only the lower depth bound is enforced here; the per-contig maximum-depth
+    mask is applied afterwards on the assembled file (see covlib)."""
     with pysam.FastaFile(reference) as fasta, \
          pysam.BGZFile(path, "wb") as bed:
         ref_seq = fasta.fetch(contig).upper()
         for pos, d in enumerate(depth):
             if pos < end - 1 and pos > start:
-                if d >= min_depth and d <= max_depth:
+                if d >= min_depth:
                     triplet = ref_seq[pos - 1:pos + 2]
                     if "N" not in triplet:
                         bed.write(f"{contig}\t{pos}\t{pos+1}\t{triplet}\t{d}\n".encode())
 
 
 def apply_subtract_bed(final_path, subtract_bed, tabix_bed=False):
-    """Remove intervals in subtract_bed from a bgzf BED file using bedtools subtract."""
+    """Drop every record of a bgzf BED file that overlaps subtract_bed.
+
+    -A removes the whole record on any overlap — exact for BiStro's 1 bp
+    records, and cheaper than the default coordinate-trimming path."""
     tmp = final_path + ".subtract.tmp.gz"
     cmd = ["bash", "-c",
-           f"bedtools subtract -header -a {final_path} -b {subtract_bed} | bgzip -c > {tmp}"]
+           f"bedtools subtract -header -A -a {final_path} -b {subtract_bed} | bgzip -c > {tmp}"]
     subprocess.run(cmd, check=True)
     os.replace(tmp, final_path)
     if tabix_bed:
