@@ -26,7 +26,7 @@ from functools import partial
 import multiprocessing as mp
 pysam.set_verbosity(0)
 
-from . import reportlib, utilib, bamlib, vcflib, contiglib
+from . import reportlib, utilib, bamlib, vcflib, contiglib, covlib
 #from reportlib import METRICS
 
 def call_somatic_mutations(region_tuple,
@@ -258,22 +258,14 @@ def call_somatic_mutations(region_tuple,
     return report, chr_mutations, depth
 
 
-def write_frags(mut_list, ctx_list, region_tuple, reference, out_dir, sample, min_depth, max_depth):
+def write_frags(mut_list, ctx_list, region_tuple, reference, out_dir, sample, min_depth):
 
     CONTIG, START, END = region_tuple
-    cap = max_depth[CONTIG] if isinstance(max_depth, dict) else max_depth
     mut_frag = os.path.join(out_dir, f"{sample}.muts.{CONTIG}.frag.bgz")
     ctx_frag = os.path.join(out_dir, f"{sample}.context.{CONTIG}.frag.bgz")
 
-    if cap is None:
-        # mean duplex coverage on this contig is below min_depth: emit nothing
-        for frag in (mut_frag, ctx_frag):
-            with pysam.BGZFile(frag, "wb"):
-                pass
-        return mut_frag, ctx_frag
-
-    vcflib.write_mut_one(mut_frag, mut_list, min_depth, cap)
-    vcflib.write_context_one(ctx_frag, CONTIG, START, END, ctx_list, reference, min_depth, cap)
+    vcflib.write_mut_one(mut_frag, mut_list, min_depth)
+    vcflib.write_context_one(ctx_frag, CONTIG, START, END, ctx_list, reference, min_depth)
 
     return mut_frag, ctx_frag
 
@@ -352,20 +344,17 @@ def main(bam,
     
     del results
 
-    max_thr = reportlib.get_maximum_coverage_per_contig(
-        merged_report.callable_bps,
-        merged_report.total_length_ref,
-        merged_report.chrom_name,
-        min_depth=min_depth,
-    )
-    
+    # Launch the raw-read coverage scan now; it only needs the BAM and runs in
+    # the background, overlapping fragment writing + assembly below.
+    contigs = [c for c, _, _ in contigs_list]
+    mosdepth_run = covlib.start_mosdepth(bam, out_dir, sample, contigs, threads=nproc)
+
     worker2 = partial(write_frags,
                       min_depth = min_depth,
-                      max_depth = max_thr,
                       sample=sample,
                       reference=reference,
                       out_dir=out_dir)
-    
+
     with mp.Pool(processes=nproc) as pool2:
         # results are in the SAME ORDER as contigs_list (pool.map preserves order)
         results2 = pool2.starmap(worker2, zip(mut_list, ctx_list, contigs_list))
@@ -377,28 +366,50 @@ def main(bam,
     # ---- assemble outputs from the per-contig fragments ----
     # mut-bed: prepend the shared header, concat fragments (no tabix, matching write_mut_bed).
     mut_file = os.path.join(out_dir, f"{sample}.muts.bed.gz")
-    max_depth_hdr = "per-contig:mean+4*sqrt(mean)" if isinstance(max_thr, dict) else max_thr
+    max_depth_hdr = f"per-contig raw (single-strand read) mean+{covlib.SIGMA}*sqrt(mean) @MAPQ{covlib.COV_MAPQ} (high-coverage regions subtracted)"
     mut_header = "\n".join(vcflib.mut_bed_header(sample, reference, merged_report.filtering_params + (max_depth_hdr,) ))
     uno = time.time() / 60
     vcflib.finalize_bgzf(mut_file, mut_header, mut_frags, tabix_bed=False)
     dos = time.time() / 60
     utilib.cprint(f"Writing {os.path.basename(mut_file)} completed. Time elapsed {round(dos - uno,2)} min.")
-    if subtract_bed:
-        vcflib.apply_subtract_bed(mut_file, subtract_bed, tabix_bed=False)
-
 
     vcflib.write_report(out_dir, sample, merged_report)
-    vcflib.write_merged_coverages(merged_report, out_dir, sample, max_depth=max_thr)
 
     # context: single-line header, concat fragments, then tabix-index.
     context_file = os.path.join(out_dir, f"{sample}.context.bed.gz")
-    header_ctx = f"##Minimum depth: {min_depth}; Maximum depth: per-contig mean+4*sqrt(mean) (duplex scale)\n##CONTIG\tSTART\tEND\tREF\tDEPTH\n"
+    header_ctx = f"##Minimum depth: {min_depth}; Maximum depth: per-contig raw (single-strand read) mean+{covlib.SIGMA}*sqrt(mean) @MAPQ{covlib.COV_MAPQ} (high-coverage regions subtracted)\n##CONTIG\tSTART\tEND\tREF\tDEPTH\n"
     uno = time.time() / 60
     vcflib.finalize_bgzf(context_file, header_ctx, ctx_frags, tabix_bed=True)
     dos = time.time() / 60
     utilib.cprint(f"Writing {os.path.basename(context_file)} completed. Time elapsed {round(dos - uno,2)} min.")
-    if subtract_bed:
-        vcflib.apply_subtract_bed(context_file, subtract_bed, tabix_bed=True)
+
+    # ---- mask low-complexity + excessive-coverage regions -----------------
+    # Raw-read depth (mosdepth, MAPQ>=20) per contig; intervals reaching
+    # round(mean + 4*sqrt(mean)) are collapsed-repeat / mis-mapping artefacts.
+    # These are merged with the optional --low_complexity_regions BED into a
+    # single mask and subtracted from the assembled .muts / .context in one
+    # bedtools pass each (was two: one per BED). The caller above is untouched.
+    uno = time.time() / 60
+    summary_txt, per_base_bed = covlib.finish_mosdepth(mosdepth_run)
+    contig_means = covlib.parse_contig_means(summary_txt, contigs)
+    max_thr = reportlib.get_maximum_coverage_per_contig(contig_means, min_depth=min_depth)
+    highcov_bed = covlib.high_coverage_bed(per_base_bed, max_thr, out_dir, sample, contigs)
+    covlib.cleanup(summary_txt, per_base_bed)
+
+    mask_bed = covlib.build_mask(out_dir, sample, contigs, subtract_bed or None, highcov_bed)
+    if mask_bed:
+        vcflib.apply_subtract_bed(mut_file, mask_bed, tabix_bed=False)
+        vcflib.apply_subtract_bed(context_file, mask_bed, tabix_bed=True)
+        os.remove(mask_bed)
+        utilib.cprint(f"Masked low-complexity + high-coverage regions from "
+                      f"{os.path.basename(mut_file)} / {os.path.basename(context_file)}.", color="green")
+    else:
+        utilib.cprint("Nothing to mask; .muts / .context unchanged.", color="green")
+    dos = time.time() / 60
+    utilib.cprint(f"Region masking completed. Time elapsed {round(dos - uno,2)} min.")
+
+    vcflib.write_merged_coverages(merged_report, out_dir, sample,
+                                  raw_means=contig_means, max_depth=max_thr)
 
     clock_end = time.time() / 60
     utilib.cprint(f"BiStro took {round(clock_end - clock_start, 2)} minutes to pre-process candidate mutations in sample {sample}", color="green")
