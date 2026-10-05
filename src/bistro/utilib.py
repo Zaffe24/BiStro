@@ -212,15 +212,16 @@ def check_inputs_sbs96(context_bed, muts_bed, ref, preset_genome=None):
     cprint("All input files validated successfully.", color="green")
 
 
-def check_inputs_cosmic(normcounts_tsv, cosmic_file):
+def check_inputs_cosmic(normcounts_files: list, groups_tsv=None):
     """
-    Validate the normcounts TSV and the COSMIC signature table before launching
-    the cosmic pipeline. Exits BiStro on the first missing file.
+    Validate every normcounts TSV and the (optional) samples/groups table before
+    launching the cosmic pipeline. Exits BiStro on the first missing file.
     """
-    if not os.path.isfile(normcounts_tsv):
-        cprint(f"ERROR: normcounts TSV not found: {normcounts_tsv}", color="red")
-        exit(1)
-    if not os.path.isfile(cosmic_file):
-        cprint(f"ERROR: COSMIC signature file not found: {cosmic_file}", color="red")
+    for tsv in normcounts_files:
+        if not os.path.isfile(tsv):
+            cprint(f"ERROR: normcounts TSV not found: {tsv}", color="red")
+            exit(1)
+    if groups_tsv and not os.path.isfile(groups_tsv):
+        cprint(f"ERROR: groups TSV not found: {groups_tsv}", color="red")
         exit(1)
     cprint("All input files validated successfully.", color="green")

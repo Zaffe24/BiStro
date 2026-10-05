@@ -51,7 +51,7 @@ BiStro has four subcommands, run in sequence:
 | [`bistro preprocess`](#bistro-preprocess) | Pre-process single-strand CCS reads into candidate mutation calls. |
 | [`bistro somatic`](#bistro-somatic) | Call true somatic mutations by interpolating preprocessed calls from all the samples run. |
 | [`bistro sbs96`](#bistro-sbs96) | Compute and correct the somatic SBS96 spectrum for trinucleotide opportunity biases. |
-| [`bistro cosmic`](#bistro-cosmic) | Cosine similarity against mutational signatures (e.g., COSMIC). |
+| [`bistro cosmic`](#bistro-cosmic) | Two-tier COSMIC signature attribution across samples (SigProfilerAssignment). |
 
 Run `bistro <subcommand> --help` at any time to expose the complete parameter list.
 
@@ -69,7 +69,7 @@ Run `bistro <subcommand> --help` at any time to expose the complete parameter li
 
 Pre-processes single-strand CCS reads into candidate mutation calls.
 
-**How it works:** For each contig, BiStro brings together every duplex's forward and reverse single-strand CCS reads and walks their jointly aligned positions. A position only enters consideration once both strands' base qualities pass `--min_bq`. If *both* strands agree on the same non-reference base, it is a double-strand candidate (`d`); if only one strand disagrees with the reference, the position is flagged as a single-strand mismatch (`m`). In addition to the `--min_depth` threshold, BiStro applies an automatic ceiling on coverage (4x the mean genome-wide callable coverage ) to avoid calling mutations in artefactually over-covered positions (likely the product of duplicated regions not annotated in the reference).
+**How it works:** For each contig, BiStro brings together every duplex's forward and reverse single-strand CCS reads and walks their jointly aligned positions. A position only enters consideration once both strands' base qualities pass `--min_bq`. If *both* strands agree on the same non-reference base, it is a double-strand candidate (`x`), later resolved by `bistro somatic` into a *de novo* (`DNM`) or germline (`GRM`) call; if only one strand disagrees with the reference, the position is flagged as a single-strand mismatch (`m`). In addition to the `--min_depth` threshold, BiStro applies an automatic ceiling on coverage (4x the mean genome-wide callable coverage ) to avoid calling mutations in artefactually over-covered positions (likely the product of duplicated regions not annotated in the reference).
 
 | Flag | Default | Description |
 |---|---|---|
@@ -103,6 +103,7 @@ Pre-processes single-strand CCS reads into candidate mutation calls.
 * `{sample}.context.bed.gz`: intermediate BED file reporting the trinucleotide type and coverage for each 1-bp position interrogated by BiStro. Needed to compute the somatic mutation rate in the following step.
 * `{sample}_coverage_report.tsv`: report of genome coverage per contig/chromosome.
 * `{sample}.report.txt`: summary of the preprocessing step.
+* `{sample}.duplex_bq_cumulative.pdf` / `.tsv`: diagnostic profile of duplex base qualities on the first analysed contig. For every duplex base-pair whose two strands both match the reference, it gives the fraction whose BQ is `>= X` on both strands. BQ is taken after `--trim_ends`/`--indels_window` masking. The profile ignores `--min_bq`, so it also counts base-pairs that fail the threshold; the run's `--min_bq` only sets where the marker sits on the curve.
 
 <br>
   
@@ -196,28 +197,46 @@ is masked to zero rather than left to dominate the spectrum.
 
 ### `bistro cosmic`
 
-Computes the cosine similarity of a BiStro SBS96 spectrum against COSMIC signatures.
+Attributes each sample's SBS96 spectrum to COSMIC SBS signatures, in two tiers. The scheme is modified from Pham et al., *A comprehensive atlas of somatic mutation rates and mutational signatures in normal human cells* (bioRxiv, [10.64898/2026.08.28.747772](https://doi.org/10.64898/2026.08.28.747772)), and refits with [SigProfilerAssignment](https://github.com/AlexandrovLab/SigProfilerAssignment).
+
+**How it works:** Refitting finds, for each sample, the non-negative combination of a fixed set of reference signatures that best reconstructs its spectrum. On its own, refitting tends to assign spurious low exposures and is unstable for samples with few mutations, so BiStro runs it twice:
+
+* **Tier 1** decides which signatures can be trusted for each group of samples. Each sample's spectrum is resampled `--nboot` times (multinomial, or Poisson with `--poisson`), and every replicate is refitted against the full COSMIC set. A signature is validated for a group when the lower bound of its 95% CI (the 2.5th percentile of the bootstrap exposures) is above 0 in at least `--min_samples` samples of that group. With `--merge_groups_tier1`, tier 1 instead runs on one pooled pseudo-sample per group (the sum of its samples).
+* **Tier 2** refits every sample against *only* its group's validated signatures, so nothing else can be assigned.
+
+Groups (e.g. cell types) come from the optional third column of the pipeline's samples TSV (see [below](#running-the-full-pipeline-with-snakemake)). Without it, all samples form one group.
 
 | Flag | Default | Description |
 |---|---|---|
-| `-i, --input` *(required)* | -- | `{sample}.normcounts.tsv` produced by `sbs96`. |
-| `--sign_file` | bundled COSMIC v3.6 GRCh38 | COSMIC SBS96 signature file (SigProfiler `Type\tSBS1\tSBS2...` layout). |
-| `--signatures` | `None` (every signature) | Optional subset of signatures to compare against, e.g. `--signatures SBS1 SBS5 SBS40`. |
-| `--column` | `Human_normfrac` | `{sample}.normcounts.tsv` column to use as the sample spectrum. |
-| `-o, --out` | `None` (stdout) | Output TSV. |
-| `--top` | `None` | Report only the N best-matching signatures. |
+| `-i, --input` *(required)* | -- | `{sample}.normcounts.tsv` files produced by `sbs96`, one per sample. The sample name is taken from the file prefix. |
+| `--groups` | `None` | Samples TSV `BAM<TAB>SAMPLE[<TAB>GROUP]`, with no header (`#` comments allowed). Without a GROUP column, or without this file, all samples form one group. |
+| `-o, --out_dir` *(required)* | -- | Output directory. |
+| `--genome` *(required)* | -- | Genome build of the reference signatures: one of `GRCh37`, `GRCh38`, `mm9`, `mm10`, `mm39`, `rn6`, `rn7` (e.g. `mm39` for GRCm39 data). |
+| `--cosmic_version` | `3.6` | COSMIC version to attribute against. |
+| `--column` | `normcounts` | `{sample}.normcounts.tsv` column used as the sample's SBS96 counts (`normcounts` is opportunity-corrected; `counts` is raw). |
+| `--nboot` | `1000` | Bootstrap iterations per sample (or per pooled group with `--merge_groups_tier1`). |
+| `--min_samples` | `3` | Samples of a group in which a signature must be detected (lower 95% CI > 0) to be validated. Ignored with `--merge_groups_tier1`. |
+| `--merge_groups_tier1` | *(flag)* | Run tier 1 on one pooled pseudo-sample per group. Tier 2 still refits every sample. |
+| `--bootstrap_tier2` | *(flag)* | Also bootstrap tier 2, to report 95% CIs on the final exposures (slower). |
+| `--poisson` | *(flag)* | Per-channel Poisson resampling instead of multinomial. |
+| `--seed` | `12345` | Seed of the bootstrap random generator. |
+| `-t, --threads` | `1` | Worker processes for each SigProfilerAssignment refit. |
 
 <br>
 
-### Output:
-* `{--out}`: a two-column table, `signature` and `cosine_similarity`, one row per COSMIC signature compared, sorted from best to worst match.
+### Output (in `--out_dir`):
+* `final_attribution.tsv`: one row per sample x validated signature, with `sample`, `group`, `signature` and `exposure` (absolute mutations), plus `lo95`/`hi95` with `--bootstrap_tier2`.
+* `tier1_signature_CIs.tsv`: one row per tier-1 sample (or pool) x signature, with the point estimate, bootstrap mean, `lo95`, `hi95` and `detected` (`lo95 > 0`).
+* `tier1_validation_summary.tsv`: one row per group x signature, with the number of samples in which it was detected and whether it was validated.
+* `validated_signatures.{group}.txt`: the COSMIC subset each group's tier 2 is fitted against.
+* The input matrices and SigProfilerAssignment's own output folders (`tier1_point/`, `tier1_boot/`, `tier2.{group}/`, with plots for the point and tier-2 fits).
 
 <br>
 
 ## Running the full pipeline with Snakemake
 
 The `workflow/` directory holds a Snakemake pipeline that runs all four stages
-across every sample listed in a samples TSV. The TSV must be formatted as {path_to_bam}\t{sample}, as shown [here](https://github.com/Zaffe24/BiStro/blob/main/tests/data/example_input.tsv).
+across every sample listed in a samples TSV. The TSV must be formatted as {path_to_bam}\t{sample}\t{group}, as shown [here](https://github.com/Zaffe24/BiStro/blob/main/tests/data/example_input.tsv). The group column is optional: it sets which samples `bistro cosmic` validates signatures over, and without it all samples form one group. Set `call_cosmic: genome:` in the config, since it is required.
 
 1. Copy the template config and **fill in your paths and parameters**:
    ```bash
@@ -239,9 +258,7 @@ across every sample listed in a samples TSV. The TSV must be formatted as {path_
 
 A dummy dataset comprising small genomic fractions of samples `E01`-`F01` and a FASTA genome snippet is present in `tests/data` for testing the pipeline.
 
-BiStro comes with COSMIC v3.6 SBS signature files (`GRCh38` and `mm10`) used as
-the default input to `bistro cosmic`. Override with `--sign_file` for another
-COSMIC release or genome build.
+`bistro cosmic` uses the COSMIC reference signatures bundled with SigProfilerAssignment, selected with `--genome` and `--cosmic_version`.
 
 <br>
 

@@ -6,9 +6,9 @@ and `cosmic` subcommands and every option they accept, via argparse.
 import sys
 import warnings
 import argparse
-from importlib.resources import files
 
-DEFAULT_SIGN_FILE = str(files("bistro").joinpath("data", "COSMIC_v3.6_SBS_GRCh38.txt"))
+# Genome builds SigProfilerAssignment ships COSMIC reference signatures for.
+SPA_GENOMES = ["GRCh37", "GRCh38", "mm9", "mm10", "mm39", "rn6", "rn7"]
 
 
 def make_wide(formatter, w=120, h=36):
@@ -205,6 +205,15 @@ def parse_args(program_version, arguments=sys.argv[1:]):
         default=None,
         help="BED file of intervals to exclude from the mutation and context outputs (e.g. repeat/low-complexity regions).",
     )
+    # Hidden: contig for the duplex BQ profile ({sample}.duplex_bq_cumulative.*);
+    # defaults to the first analysed contig in FASTA order.
+    parser_preprocess.add_argument(
+        "--bq_profile_contig",
+        type=str,
+        required=False,
+        default=None,
+        help=argparse.SUPPRESS,
+    )
     # parser_preprocess.add_argument(
     #     "--min_chr_len",
     #     type=int,
@@ -363,53 +372,96 @@ def parse_args(program_version, arguments=sys.argv[1:]):
     parser_cosmic = subparsers.add_parser(
         "cosmic",
         formatter_class=make_wide(argparse.ArgumentDefaultsHelpFormatter, w=180, h=60),
-        help="Cosine similarity of a BiStro SBS96 spectrum against COSMIC signatures.",
+        help="Two-tier COSMIC SBS signature attribution across samples (SigProfilerAssignment).",
     )
     parser_cosmic.add_argument(
         "-i",
         "--input",
         type=str,
         required=True,
-        metavar="TSV",
-        help="SAMPLE.normcounts.tsv produced by the 'sbs96' subcommand.",
-    )
-    parser_cosmic.add_argument(
-        "--sign_file",
-        type=str,
-        required=False,
-        default=DEFAULT_SIGN_FILE,
-        metavar="TSV",
-        help="COSMIC SBS96 signature file (SigProfiler 'Type\\tSBS1\\tSBS2...' layout, e.g. COSMIC_v3.6_SBS_GRCh38.txt).",
-    )
-    parser_cosmic.add_argument(
-        "--signatures",
-        type=str,
-        required=False,
         nargs="+",
+        metavar="TSV",
+        help="SAMPLE.normcounts.tsv files produced by the 'sbs96' subcommand, one per sample (sample name = file prefix).",
+    )
+    parser_cosmic.add_argument(
+        "--groups",
+        type=str,
+        required=False,
         default=None,
-        help="Optional subset of signatures to compare against (e.g. --signatures SBS1 SBS5 SBS40). Default: every signature in the COSMIC file.",
+        metavar="TSV",
+        help="Samples table of the pipeline: BAM<TAB>SAMPLE[<TAB>GROUP], no header ('#' comments allowed). GROUP is the set of samples signatures are validated over (e.g. cell type). Without a GROUP column, or without this file, all samples form one group.",
+    )
+    parser_cosmic.add_argument(
+        "-o",
+        "--out_dir",
+        type=str,
+        required=True,
+        help="Output directory (created if missing).",
+    )
+    parser_cosmic.add_argument(
+        "--genome",
+        type=str,
+        required=True,
+        choices=SPA_GENOMES,
+        help="Genome build of the COSMIC reference signatures (SigProfilerAssignment genome_build), e.g. mm39 for GRCm39 data.",
+    )
+    parser_cosmic.add_argument(
+        "--cosmic_version",
+        type=str,
+        required=False,
+        default="3.6",
+        help="COSMIC version to attribute against.",
     )
     parser_cosmic.add_argument(
         "--column",
         type=str,
         required=False,
-        default="Human_normfrac",
-        help="normcounts.tsv column to use as the sample spectrum (Human_normfrac is the spectrum corrected on human-genome opportunity, which is what COSMIC signatures are defined on).",
+        default="normcounts",
+        help="normcounts.tsv column used as each sample's SBS96 counts (normcounts = counts corrected for trinucleotide opportunity; counts = raw).",
     )
     parser_cosmic.add_argument(
-        "-o",
-        "--out",
-        type=str,
-        required=False,
-        default=None,
-        help="Output TSV. Default: print to stdout.",
-    )
-    parser_cosmic.add_argument(
-        "--top",
+        "--nboot",
         type=int,
         required=False,
-        default=None,
-        help="Report only the N best-matching signatures.",
+        default=1000,
+        help="Bootstrap iterations per sample (or per pooled group with --merge_groups_tier1).",
+    )
+    parser_cosmic.add_argument(
+        "--min_samples",
+        type=int,
+        required=False,
+        default=3,
+        help="A signature is validated for a group if its lower 95%% CI > 0 in at least this many samples of the group (ignored with --merge_groups_tier1).",
+    )
+    parser_cosmic.add_argument(
+        "--merge_groups_tier1",
+        action="store_true",
+        help="Run tier 1 on one pooled pseudo-sample per group (sum of its samples); validation is then lower-95%% CI > 0 for that pool. Tier 2 still refits every sample.",
+    )
+    parser_cosmic.add_argument(
+        "--bootstrap_tier2",
+        action="store_true",
+        help="Also bootstrap the tier-2 refit to report 95%% CIs on the final exposures (slower).",
+    )
+    parser_cosmic.add_argument(
+        "--poisson",
+        action="store_true",
+        help="Per-channel Poisson resampling instead of multinomial.",
+    )
+    parser_cosmic.add_argument(
+        "--seed",
+        type=int,
+        required=False,
+        default=12345,
+        help="Seed of the bootstrap random generator.",
+    )
+    parser_cosmic.add_argument(
+        "-t",
+        "--threads",
+        type=int,
+        required=False,
+        default=1,
+        help="Worker processes for each SigProfilerAssignment refit.",
     )
 
     if len(arguments) == 0:
