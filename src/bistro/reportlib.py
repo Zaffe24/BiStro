@@ -59,11 +59,19 @@ class METRICS:
             return round(self.callable_bps / self.total_length_ref,2)
 
 
+    def is_collapsed(self):
+        # read_mode is the last filtering parameter (see caller.call_somatic_mutations)
+        return bool(self.filtering_params) and self.filtering_params[-1] == "collapsed"
+
     def __str__(self):
-        
+
+        if self.is_collapsed():   # one read = one molecule
+            molecules = f"Total molecules (reads):\t{self.num_zmw} ({self.gp(self.num_zmw,self.num_reads)}%)"
+        else:
+            molecules = f"Total ZMW duplexes:\t\t{self.num_zmw} ({2 * self.gp(self.num_zmw,self.num_reads)}%)" #each duplex is formed by two reads only
         lines = [f"#STATS FROM MUTATION CALLING STEP:\t{self.get_chr_name()}",
                  f"Total reads processed:\t\t{self.num_reads}",
-                 f"Total ZMW duplexes:\t\t{self.num_zmw} ({2 * self.gp(self.num_zmw,self.num_reads)}%)", #each duplex is formed by two reads only
+                 molecules,
                  "",
                  f"Total reads discarded:\t\t{self.num_discarded} ({self.gp(self.num_discarded,self.num_reads)}%)",
                  f"\tNot-primary reads:\t{self.disc_no_primary} ({self.gp(self.disc_no_primary, self.num_discarded)}%)",

@@ -8,6 +8,10 @@ BED fragments that main() then merges into the sample's .muts.bed.gz /
 .context.bed.gz outputs. The `somatic` subcommand (sharelib.py) later decides
 which of these double-strand candidates (TYPE x) are de novo or germline.
 On one contig the walk also records a duplex base-quality profile (bqlib.py).
+
+With --collapsed, reads are not paired: every read that passes the filters is
+its own molecule and is walked on its own (bamlib.walk_collapsed), so there are
+no single-strand mismatches (TYPE m) and nothing is blacklisted around them.
 """
 
 # import sys
@@ -45,7 +49,7 @@ def call_somatic_mutations(region_tuple,
                            max_softclipping,
                            z_prob,
                            check_mem_usage,
-                           do_not_collapse,
+                           collapsed,
                            min_depth,
                            bq_profile_contig):
 
@@ -62,7 +66,8 @@ def call_somatic_mutations(region_tuple,
                            mismatch_window_len,
                            min_ec,
                            max_softclipping,
-                           min_depth
+                           min_depth,
+                           "collapsed" if collapsed else "duplex"   # read_mode: keep last (METRICS.is_collapsed)
                            )
     
     CONTIG, START, END = region_tuple
@@ -79,7 +84,7 @@ def call_somatic_mutations(region_tuple,
     with pysam.AlignmentFile(bam, "rb") as bam_file, \
     pysam.FastaFile(reference) as fasta:
         ref_seq = fasta.fetch(CONTIG).upper()
-        ref_arr = np.frombuffer(ref_seq.encode("ascii"), dtype=np.uint8) if bq_hist is not None else None
+        ref_arr = np.frombuffer(ref_seq.encode("ascii"), dtype=np.uint8) if (bq_hist is not None or collapsed) else None
 
         for ss_strand in bam_file.fetch(CONTIG, START, END):
             # ------------------------------------------------
@@ -97,6 +102,34 @@ def call_somatic_mutations(region_tuple,
             # decrease memory burden before storing reads
             # ------------------------------------------------
             ss_strand = bamlib.remove_useless_tags(ss_strand)
+
+            if collapsed:
+                # ------------------------------------------------
+                # Collapsed mode: every read is its own molecule (no fwd/rev pairing)
+                # ------------------------------------------------
+                report.num_zmw += 1
+                if report.num_zmw in check_mem_usage:
+                    utilib.cprint(f"[{wrk}]\tMEM OCCUPIED: {utilib.get_stats()}\tRead counter for {CONTIG}: {report.num_zmw}")
+
+                read = bamlib.mask_indels(bamlib.mask_ends(ss_strand, trim_ends), indels_window)
+                s = read.query_sequence.upper()
+                q = np.array(read.query_qualities, dtype=np.uint8)
+                qpos, rpos = bamlib.aligned_pairs_array(read)
+
+                if bq_hist is not None:
+                    bqlib.add_read(bq_hist, qpos, rpos, s, q, ref_arr)
+
+                context_positions, rec_qpos, rec_rpos, rec_type = bamlib.walk_collapsed(
+                    qpos, rpos, s, q, ref_arr, min_bq, z_prob)
+                # no second strand -> no single-strand mismatches to blacklist around
+                report.callable_bps += len(context_positions)
+                depth[context_positions] += 1
+
+                chr_mutations += bamlib.process_mutations_collapsed(read, rec_qpos, rec_rpos, rec_type,
+                                                                    s, q, mismatch_window_len, CONTIG,
+                                                                    read.query_name, ref_seq)
+                continue
+
             strand, zmw= ss_strand.query_name.split("/")[-1], ss_strand.get_tag("zm")
             #print(strand, zmw)
             # ------------------------------------------------
@@ -143,7 +176,6 @@ def call_somatic_mutations(region_tuple,
             # ------------------------------------------------
             # Walking through the duplex and record positions of interest
             # ------------------------------------------------
-        #if do_not_collapse:
             context_positions = []
             list_qpos1=[]
             list_qpos2=[]
@@ -257,13 +289,13 @@ def call_somatic_mutations(region_tuple,
     return report, chr_mutations, depth, bq_hist
 
 
-def write_frags(mut_list, ctx_list, region_tuple, reference, out_dir, sample, min_depth):
+def write_frags(mut_list, ctx_list, region_tuple, reference, out_dir, sample, min_depth, collapsed=False):
 
     CONTIG, START, END = region_tuple
     mut_frag = os.path.join(out_dir, f"{sample}.muts.{CONTIG}.frag.bgz")
     ctx_frag = os.path.join(out_dir, f"{sample}.context.{CONTIG}.frag.bgz")
 
-    vcflib.write_mut_one(mut_frag, mut_list, min_depth)
+    vcflib.write_mut_one(mut_frag, mut_list, min_depth, collapsed)
     vcflib.write_context_one(ctx_frag, CONTIG, START, END, ctx_list, reference, min_depth)
 
     return mut_frag, ctx_frag
@@ -288,7 +320,7 @@ def main(bam,
             max_softclipping,
             z_prob,
             check_mem_usage,
-            do_not_collapse,
+            collapsed,
             min_depth,
             subtract_bed,
             bq_profile_contig=None):
@@ -303,6 +335,8 @@ def main(bam,
         utilib.cprint(f"Calling Mutations only on Chromosomes: {region}.", color="green")
     if exclude:
         utilib.cprint(f"Excluding Chromosomes: {exclude}", color="green")
+    if collapsed:
+        utilib.cprint("Collapsed mode: every read is treated as an independent molecule (no ZMW duplex pairing).", color="green")
 
     # Duplex BQ profile defaults to the first analysed contig (FASTA/.fai order).
     if bq_profile_contig is None:
@@ -328,7 +362,7 @@ def main(bam,
                     max_softclipping=max_softclipping,
                     z_prob=z_prob,
                     check_mem_usage=checkpoints,
-                    do_not_collapse=do_not_collapse,
+                    collapsed=collapsed,
                     min_depth = min_depth,
                     bq_profile_contig=bq_profile_contig
                     )
@@ -348,7 +382,7 @@ def main(bam,
 
     del results
 
-    bqlib.write_bq_profile(bq_hist, out_dir, sample, bq_profile_contig, min_bq)
+    bqlib.write_bq_profile(bq_hist, out_dir, sample, bq_profile_contig, min_bq, collapsed)
 
     # Launch the raw-read coverage scan now; it only needs the BAM and runs in
     # the background, overlapping fragment writing + assembly below.
@@ -358,7 +392,8 @@ def main(bam,
                       min_depth = min_depth,
                       sample=sample,
                       reference=reference,
-                      out_dir=out_dir)
+                      out_dir=out_dir,
+                      collapsed=collapsed)
 
     with mp.Pool(processes=nproc) as pool2:
         # results are in the SAME ORDER as contigs_list (pool.map preserves order)
@@ -371,7 +406,8 @@ def main(bam,
     # ---- assemble outputs from the per-contig fragments ----
     # mut-bed: prepend the shared header, concat fragments (no tabix, matching write_mut_bed).
     mut_file = os.path.join(out_dir, f"{sample}.muts.bed.gz")
-    max_depth_hdr = f"per-contig raw (single-strand read) mean+{covlib.SIGMA}*sqrt(mean) @MAPQ{covlib.COV_MAPQ} (high-coverage regions subtracted)"
+    raw_unit = "read" if collapsed else "single-strand read"
+    max_depth_hdr = f"per-contig raw ({raw_unit}) mean+{covlib.SIGMA}*sqrt(mean) @MAPQ{covlib.COV_MAPQ} (high-coverage regions subtracted)"
     mut_header = "\n".join(vcflib.mut_bed_header(sample, reference, merged_report.filtering_params + (max_depth_hdr,) ))
     uno = time.time() / 60
     vcflib.finalize_bgzf(mut_file, mut_header, mut_frags, tabix_bed=False)
@@ -382,7 +418,7 @@ def main(bam,
 
     # context: single-line header, concat fragments, then tabix-index.
     context_file = os.path.join(out_dir, f"{sample}.context.bed.gz")
-    header_ctx = f"##Minimum depth: {min_depth}; Maximum depth: per-contig raw (single-strand read) mean+{covlib.SIGMA}*sqrt(mean) @MAPQ{covlib.COV_MAPQ} (high-coverage regions subtracted)\n##CONTIG\tSTART\tEND\tREF\tDEPTH\n"
+    header_ctx = f"##Minimum depth: {min_depth}; Maximum depth: per-contig raw ({raw_unit}) mean+{covlib.SIGMA}*sqrt(mean) @MAPQ{covlib.COV_MAPQ} (high-coverage regions subtracted)\n##CONTIG\tSTART\tEND\tREF\tDEPTH\n"
     uno = time.time() / 60
     vcflib.finalize_bgzf(context_file, header_ctx, ctx_frags, tabix_bed=True)
     dos = time.time() / 60

@@ -31,7 +31,7 @@ call_preprocess:
   max_softclipping: .2
   z_prob: 1000000
   check_mem_usage: 100000
-  #do_not_collapse: True
+  collapsed: False          # True: collapsed reads (e.g. standard HiFi), each read is its own molecule
 
 # Passed straight through to `bistro somatic`. See `bistro somatic --help`.
 call_somatic:

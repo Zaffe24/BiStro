@@ -20,17 +20,37 @@ import gzip
 import pandas as pd
 
 
+def mode_glossary(collapsed):
+    # Glossary lines whose meaning depends on the read mode (--collapsed); same
+    # column layout in both modes so downstream parsing is unchanged.
+    if collapsed:
+        return {"zmw":  "## 4  ZMW      molecule id = read name (collapsed mode: one read per molecule)",
+                "s1":   "## 7  STRAND_1 read call, colon-delimited (see sub-fields below)",
+                "s2":   "## 8  STRAND_2 '.' (collapsed mode: no second strand)",
+                "nob":  "## 9  NOB      0 (collapsed mode: no second read)",
+                "nmis": "## 10 N_MIS    0 (collapsed mode: no single-strand mismatches)",
+                "type": "## 11 TYPE     x=mutation (de novo or germline, resolved by `somatic`)  z=non-mutated random"}
+    return {"zmw":  "## 4  ZMW      Zero-Mode Waveguide id (duplex pair)",
+            "s1":   "## 7  STRAND_1 fwd-strand call, colon-delimited (see sub-fields below)",
+            "s2":   "## 8  STRAND_2 rev-strand call, colon-delimited (see sub-fields below)",
+            "nob":  "## 9  NOB      number of non-overlapping bases between the two reads",
+            "nmis": "## 10 N_MIS    mismatches within the QB window (default 20)",
+            "type": "## 11 TYPE     x=ds-mutation (de novo or germline, resolved by `somatic`)  z=non-mutated random  m=mismatch"}
+
+
 def mut_bed_header(sample, reference, filtering_params):
 
     min_mapq, min_sequence_identity, min_bq, min_qlen, max_qlen, \
         trim_percentage, indels_window, mismatch_window_len, min_ec, \
-            max_softclipping, min_depth, max_depth = filtering_params
+            max_softclipping, min_depth, read_mode, max_depth = filtering_params
+    g = mode_glossary(read_mode == "collapsed")
 
     filters = (f"min_mapq={min_mapq};min_ec={min_ec};"
                f"min_qlen={min_qlen};max_qlen={max_qlen};"
                f"max_softclip={max_softclipping};min_identity={min_sequence_identity};"
                f"min_bq={min_bq};trim_pct={trim_percentage};"
-               f"indels_window={indels_window};mismatch_window={mismatch_window_len};min_depth={min_depth};max_depth={max_depth}")
+               f"indels_window={indels_window};mismatch_window={mismatch_window_len};min_depth={min_depth};max_depth={max_depth};"
+               f"read_mode={read_mode}")
 
     return [f"##fileformat=BiStro-bed-v{__main__.__version__}",
             f"##sample={sample}",
@@ -43,14 +63,14 @@ def mut_bed_header(sample, reference, filtering_params):
              "## 1  CONTIG   reference contig name",
              "## 2  START    0-based start of the position",
              "## 3  END      half-open end (START+1)",
-             "## 4  ZMW      Zero-Mode Waveguide id (duplex pair)",
+             g["zmw"],
              "## 5  CTX      reference triplet centered on the position",
              "## 6  REF      reference base",
-             "## 7  STRAND_1 fwd-strand call, colon-delimited (see sub-fields below)",
-             "## 8  STRAND_2 rev-strand call, colon-delimited (see sub-fields below)",
-             "## 9  NOB      number of non-overlapping bases between the two reads",
-             "## 10 N_MIS    mismatches within the QB window (default 20)",
-             "## 11 TYPE     x=ds-mutation (de novo or germline, resolved by `somatic`)  z=non-mutated random  m=mismatch",
+             g["s1"],
+             g["s2"],
+             g["nob"],
+             g["nmis"],
+             g["type"],
              "## 12 DEPTH    read coverage at that position",
              "##",
              "## STRAND_1 / STRAND_2 sub-fields (colon-delimited):",
@@ -86,7 +106,10 @@ def write_merged_coverages(merged, out_dir, sample, raw_means=None, max_depth=No
     max_depth = max_depth or {}
 
     with open(file_name, "w") as f:
-        f.write("## DUPLEX_COVERAGE = CALLABLE_BPS / LENGTH (mean BiStro duplex depth).\n")
+        if merged.is_collapsed():
+            f.write("## DUPLEX_COVERAGE = CALLABLE_BPS / LENGTH (mean BiStro molecule depth; collapsed mode: reads).\n")
+        else:
+            f.write("## DUPLEX_COVERAGE = CALLABLE_BPS / LENGTH (mean BiStro duplex depth).\n")
         f.write("## RAW_COVERAGE   = mean raw-read depth from mosdepth, MAPQ>=20.\n")
         f.write("## MAX_DEPTH      = round(RAW_COVERAGE + 4*sqrt(RAW_COVERAGE)); reference\n")
         f.write("##   intervals whose raw depth reached this were removed from the\n")
@@ -100,18 +123,22 @@ def write_merged_coverages(merged, out_dir, sample, raw_means=None, max_depth=No
     utilib.cprint(f"Report of Chromosome Coverages saved to: {os.path.basename(file_name)}")
 
 
-def write_mut_one(path, mut_list, min_depth):
+def write_mut_one(path, mut_list, min_depth, collapsed=False):
     """Write one contig's mutations as a headerless bgzf fragment.
 
     Only the lower depth bound is enforced here; the per-contig maximum-depth
-    mask is applied afterwards on the assembled file (see covlib)."""
+    mask is applied afterwards on the assembled file (see covlib).
+    Collapsed rows carry one read's sub-fields only: STRAND_2 is written as "."."""
     with pysam.BGZFile(path, "wb") as bed:
         for mut in mut_list:
             if mut[-1] >= min_depth:
                 str_mut = [str(x) for x in mut]
                 block1 = ":".join(str_mut[6:15])
-                block2 = ":".join(str_mut[15:24])
-                bed.write(("\t".join(x for x in (str_mut[:6]+[block1]+[block2]+str_mut[24:])) + "\n").encode())
+                if collapsed:
+                    block2, rest = ".", str_mut[15:]
+                else:
+                    block2, rest = ":".join(str_mut[15:24]), str_mut[24:]
+                bed.write(("\t".join(x for x in (str_mut[:6]+[block1]+[block2]+rest)) + "\n").encode())
 
 
 def write_context_one(path, contig, start, end, depth, reference, min_depth):
@@ -164,21 +191,22 @@ def finalize_bgzf(final_path, header, frag_paths, tabix_bed=False):
 
 
 
-def mut_header_shared(samples):
+def mut_header_shared(samples, collapsed=False):
+    g = mode_glossary(collapsed)
 
     return ["##",
              "## Column glossary (in output order)",
              "## 1  CONTIG   reference contig name",
              "## 2  START    0-based start of the position",
              "## 3  END      half-open end (START+1)",
-             "## 4  ZMW      Zero-Mode Waveguide id (duplex pair)",
+             g["zmw"],
              "## 5  CTX      reference triplet centered on the position",
              "## 6  REF      reference base",
-             "## 7  STRAND_1 fwd-strand call, colon-delimited (see sub-fields below)",
-             "## 8  STRAND_2 rev-strand call, colon-delimited (see sub-fields below)",
-             "## 9  NOB      number of non-overlapping bases between the two reads",
-             "## 10 N_MIS    mismatches within the QB window (default 20)",
-             "## 11 TYPE     x=ds-mutation (de novo or germline, resolved by `somatic`)  z=non-mutated random  m=mismatch",
+             g["s1"],
+             g["s2"],
+             g["nob"],
+             g["nmis"],
+             g["type"],
              "## 12 DEPTH    read coverage at that position",
              "## 13 SHARED    Number of samples in which the mutation is observed",
              "## 14 ANNOTATION    Revised annotation for TYPE categories",
@@ -203,21 +231,22 @@ def mut_header_shared(samples):
                         "COUNTS"]) + "\n"
         ]
 
-def mut_header_single(samples):
+def mut_header_single(samples, collapsed=False):
+    g = mode_glossary(collapsed)
 
     return ["##",
              "## Column glossary (in output order)",
              "## 1  CONTIG   reference contig name",
              "## 2  START    0-based start of the position",
              "## 3  END      half-open end (START+1)",
-             "## 4  ZMW      Zero-Mode Waveguide id (duplex pair)",
+             g["zmw"],
              "## 5  CTX      reference triplet centered on the position",
              "## 6  REF      reference base",
-             "## 7  STRAND_1 fwd-strand call, colon-delimited (see sub-fields below)",
-             "## 8  STRAND_2 rev-strand call, colon-delimited (see sub-fields below)",
-             "## 9  NOB      number of non-overlapping bases between the two reads",
-             "## 10 N_MIS    mismatches within the QB window (default 20)",
-             "## 11 TYPE     x=ds-mutation (de novo or germline, resolved by `somatic`)  z=non-mutated random  m=mismatch",
+             g["s1"],
+             g["s2"],
+             g["nob"],
+             g["nmis"],
+             g["type"],
              "## 12 DEPTH    read coverage at that position",
              "## 13 ANNOTATION    Revised annotation for TYPE categories",
              "##",
@@ -235,23 +264,27 @@ def mut_header_single(samples):
 
 
 def copy_header(src, dst, max_lines=5):
+    # Returns the copied lines (they include preprocess's ##filters line).
     i = 0
+    copied = []
     for line in src:
         if not line.startswith(b"#") or i > max_lines:
             break
         i += 1
         dst.write(line)
+        copied.append(line)
+    return copied
 
 
 def write_mut_shared(df, input, samples, output, single=False):
 
     with gzip.open(input, "rb") as src, pysam.BGZFile(output, "wb") as dst:
+        # the read mode travels in preprocess's ##filters line (read_mode=...)
+        collapsed = any(b"read_mode=collapsed" in line for line in copy_header(src, dst))
         if single:
-            copy_header(src, dst)
-            dst.write(("\n".join(mut_header_single(samples))).encode())
+            dst.write(("\n".join(mut_header_single(samples, collapsed))).encode())
         else:
-            copy_header(src, dst)
-            dst.write(("\n".join(mut_header_shared(samples))).encode())
+            dst.write(("\n".join(mut_header_shared(samples, collapsed))).encode())
         dst.write(df.to_csv(sep="\t", header=False, index=False).encode())
 
 

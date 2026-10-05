@@ -71,6 +71,8 @@ Pre-processes single-strand CCS reads into candidate mutation calls.
 
 **How it works:** For each contig, BiStro brings together every duplex's forward and reverse single-strand CCS reads and walks their jointly aligned positions. A position only enters consideration once both strands' base qualities pass `--min_bq`. If *both* strands agree on the same non-reference base, it is a double-strand candidate (`x`), later resolved by `bistro somatic` into a *de novo* (`DNM`) or germline (`GRM`) call; if only one strand disagrees with the reference, the position is flagged as a single-strand mismatch (`m`). In addition to the `--min_depth` threshold, BiStro applies an automatic ceiling on coverage (4x the mean genome-wide callable coverage ) to avoid calling mutations in artefactually over-covered positions (likely the product of duplicated regions not annotated in the reference).
 
+**Collapsed mode (`--collapsed`):** for reads that are not strand-resolved (e.g. standard PacBio HiFi), each read that passes the filters counts as its own molecule. At every aligned position whose BQ passes `--min_bq`, a base matching the reference is callable, and a base differing from it is a candidate (`x`). Every other parameter applies as in duplex mode. Without a second strand there are no single-strand mismatches: no `m` records, no masking around them, and `N_MIS` is always 0. The output layout is unchanged: `ZMW` holds the read name, `STRAND_1` the read, `STRAND_2` is `.` and `NOB` is 0. The `##filters` header records `read_mode=collapsed`. `somatic`, `sbs96` and `cosmic` run unchanged on these outputs; `--max_muts_per_duplex` then applies per read.
+
 | Flag | Default | Description |
 |---|---|---|
 | `-i, --bam` *(required)* | -- | BAM file with single-strand CCS reads aligned via `pbmm2 align --preset CCS`. |
@@ -94,7 +96,7 @@ Pre-processes single-strand CCS reads into candidate mutation calls.
 | `--max_softclipping` | `0.2` | Maximum proportion of soft-clipped bases allowed in a read. |
 | `--z_prob` | `0` | Debug feature: set to `1000000` to randomly record a reference base pair with probability 1/1000000, for error-model estimation. `0` disables it. |
 | `--check_mem_usage` | `10000` | Debug feature: how often (in processed ZMW duplexes) to check memory usage. `0` disables the check. |
-| `--do_not_collapse` | `True` | Debug feature: report mutations at the read level without collapsing to ZMW duplexes. |
+| `--collapsed` | *(flag)* | Collapsed reads (e.g. standard PacBio HiFi): every read is an independent molecule, with no fwd/rev duplex pairing. See below. |
 
 <br>
 
