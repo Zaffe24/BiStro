@@ -40,7 +40,7 @@ def main():
             options.max_softclipping,
             options.z_prob,
             options.check_mem_usage,
-            options.do_not_collapse,
+            options.collapsed,
             options.min_depth,
             options.low_complexity_regions,
             options.bq_profile_contig,

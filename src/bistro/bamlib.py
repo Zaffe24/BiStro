@@ -2,7 +2,8 @@
 Per-read helpers used by caller.py: quality-based rejection of individual CCS
 reads, base-quality masking near read ends and indels, and building the
 mutation record rows for every candidate position found in a fwd/rev duplex
-pair.
+pair or, with --collapsed, in a single read (walk_collapsed /
+process_mutations_collapsed).
 """
 
 #import sys
@@ -124,6 +125,97 @@ def remove_useless_tags(read: pysam.AlignedSegment):
         #else:
             #print(f"TAG {tag} NOT PRESENT")
     return read
+
+
+# ---------------------------------------------------------------------------
+# Collapsed mode (--collapsed): every read is its own molecule
+# ---------------------------------------------------------------------------
+# indexed by CIGAR op code: M I D N S H P = X B
+_CONSUMES_QUERY = np.array([1, 1, 0, 0, 1, 0, 0, 1, 1, 0], dtype=np.int64)
+_CONSUMES_REF   = np.array([1, 0, 1, 1, 0, 0, 0, 1, 1, 0], dtype=np.int64)
+_IS_MATCH       = np.array([1, 0, 0, 0, 0, 0, 0, 1, 1, 0], dtype=bool)
+_N = ord("N")
+
+
+def aligned_pairs_array(read: pysam.AlignedSegment):
+    """(qpos, rpos) int64 arrays of the read's M/=/X positions: the same pairs as
+    get_aligned_pairs(matches_only=True), built from the CIGAR without Python tuples."""
+    ct = np.asarray(read.cigartuples, dtype=np.int64)
+    ops, lens = ct[:, 0], ct[:, 1]
+    qlens = lens * _CONSUMES_QUERY[ops]
+    rlens = lens * _CONSUMES_REF[ops]
+    qstart = np.cumsum(qlens) - qlens
+    rstart = read.reference_start + np.cumsum(rlens) - rlens
+    is_m = _IS_MATCH[ops]
+    mlens = lens[is_m]
+    offs = np.arange(mlens.sum()) - np.repeat(np.cumsum(mlens) - mlens, mlens)
+    return np.repeat(qstart[is_m], mlens) + offs, np.repeat(rstart[is_m], mlens) + offs
+
+
+def walk_collapsed(qpos, rpos, seq, qual, ref_arr, min_bq, z_prob):
+    """Collapsed-mode counterpart of caller.py's duplex walk, vectorised over one read.
+
+    Over the aligned positions whose BQ >= min_bq: a base equal to the reference is
+    callable context; a non-N base differing from a non-N reference base is a candidate
+    substitution (TYPE x, also callable, as in the duplex walk). With z_prob > 0 each
+    reference-matching position is also recorded as a random baseline (TYPE z) with
+    probability 1/z_prob. With no second strand there is no single-strand mismatch
+    (TYPE m), hence nothing to blacklist around.
+
+    Returns (context_rpos, rec_qpos, rec_rpos, rec_type); records in reference order.
+    """
+    base = np.frombuffer(seq.encode("ascii"), dtype=np.uint8)[qpos]
+    ref = ref_arr[rpos]
+    ok = qual[qpos] >= min_bq
+    is_ref = base == ref
+    match = ok & is_ref
+    subst = ok & ~is_ref & (base != _N) & (ref != _N)
+    keep = subst
+    if z_prob > 0:
+        keep = subst | (match & (np.random.randint(1, z_prob + 1, size=len(match)) == 1))
+    rec_type = np.where(subst[keep], "x", "z").tolist()
+    return rpos[match | subst], qpos[keep], rpos[keep], rec_type
+
+
+def process_mutations_collapsed(read: pysam.AlignedSegment,
+                                rec_qpos, rec_rpos, rec_type,
+                                seq, qual,
+                                mismatch_window_len, contig,
+                                mol_id, fasta):
+    """Mutation rows for one collapsed read, in process_mutations' layout with the
+    read as STRAND_1 and no STRAND_2 sub-fields (written as "." by
+    vcflib.write_mut_one); NOB and N_MIS are 0 (no second read, no ss mismatches).
+    SM is "." when the read has no `sm` tag (not all HiFi BAMs carry it)."""
+    output = []
+    if len(rec_type) > 0:
+        ln = read.query_length
+        ec = int(read.get_tag("ec"))
+        idn = get_seq_identity(read)
+        sm = read.get_tag("sm") if read.has_tag("sm") else None
+
+        for p, r, t in zip(rec_qpos.tolist(), rec_rpos.tolist(), rec_type):
+            qual_range = qual[np.arange(max(p - mismatch_window_len, 0), min(ln, p+mismatch_window_len+1))]
+            output.append([contig,
+                           r,
+                           r+1,
+                           mol_id,
+                           fasta[r -1 : r+2],
+                           fasta[r],
+
+                           seq[p],
+                           qual[p],
+                           p,
+                           ec,
+                           sm[p] if sm is not None else ".",
+                           ln,
+                           idn,
+                           round(np.mean(qual_range),2),
+                           round(np.std(qual_range),2),
+
+                           0,     # NOB
+                           0,     # N_MIS
+                           t])
+    return output
 
 
 def process_mutations(read1:pysam.AlignedSegment,

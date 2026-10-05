@@ -193,10 +193,9 @@ def parse_args(program_version, arguments=sys.argv[1:]):
         help="How often (in number of processed ZMW duplexes) to check memory usage. If set to 0, memory usage will not be checked during the run.",
     )
     parser_preprocess.add_argument(
-        "--do_not_collapse",
+        "--collapsed",
         action="store_true",
-        default=True,
-        help="If set, mutations will be reported at the read level without collapsing to ZMW duplexes. This is useful for debugging and error model estimation.",
+        help="Collapsed reads (e.g. standard PacBio HiFi): treat every read as an independent molecule instead of pairing the fwd/rev single-strand reads of a ZMW into a duplex. All filters apply; single-strand mismatches (TYPE m, their masking, N_MIS) do not exist in this mode.",
     )
     parser_preprocess.add_argument(
         "--low_complexity_regions",

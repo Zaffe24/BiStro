@@ -5,6 +5,8 @@ BOTH strands match the reference is binned by min(fwd BQ, rev BQ), taken after
 mask_ends / mask_indels and before the --min_bq gate. The result is reported as
 the fraction of matched base-pairs whose two strands both reach BQ >= X
 (cumulative curve modelled on duplex_bq_profile.py's plot_cumulative).
+With --collapsed there is no second strand: each read base matching the
+reference is binned by its own BQ (same files, labels say "read").
 """
 
 import os
@@ -72,7 +74,15 @@ def add_duplex(hist, aln1, aln2, s1, s2, q1, q2, ref_arr):
     hist += np.bincount(bq, minlength=N_BQ)
 
 
-def write_bq_profile(hist, out_dir, sample, contig, min_bq):
+def add_read(hist, qpos, rpos, seq, qual, ref_arr):
+    """Collapsed mode: add one read's reference-matching bases to hist, by BQ.
+    qpos/rpos: bamlib.aligned_pairs_array of the read; qual: masked qualities."""
+    base = np.frombuffer(seq.encode("ascii"), dtype=np.uint8)[qpos]
+    matched = base == ref_arr[rpos]
+    hist += np.bincount(qual[qpos[matched]], minlength=N_BQ)
+
+
+def write_bq_profile(hist, out_dir, sample, contig, min_bq, collapsed=False):
     """Write {sample}.duplex_bq_cumulative.tsv + .pdf; returns (tsv, pdf)."""
     tsv = os.path.join(out_dir, f"{sample}.duplex_bq_cumulative.tsv")
     pdf = os.path.join(out_dir, f"{sample}.duplex_bq_cumulative.pdf")
@@ -87,24 +97,34 @@ def write_bq_profile(hist, out_dir, sample, contig, min_bq):
     with open(tsv, "w") as f:
         f.write(f"##sample={sample}\n")
         f.write(f"##contig={contig}\n")
-        f.write(f"##matched_duplex_bp={n}\n")
-        f.write("## BQ      = min(fwd-strand BQ, rev-strand BQ) of a duplex base-pair whose two strands both\n")
-        f.write("##           match the reference; taken after --trim_ends/--indels_window masking (masked\n")
-        f.write("##           bases have BQ 0) and before the --min_bq gate.\n")
-        f.write("## COUNT   = matched base-pairs with exactly this BQ.\n")
-        f.write("## FRAC_GE = fraction of matched base-pairs with BQ >= this value on both strands.\n")
+        if collapsed:
+            f.write(f"##matched_read_bases={n}\n")
+            f.write("## BQ      = BQ of a read base (collapsed mode: one read per molecule) that matches the\n")
+            f.write("##           reference; taken after --trim_ends/--indels_window masking (masked\n")
+            f.write("##           bases have BQ 0) and before the --min_bq gate.\n")
+            f.write("## COUNT   = matched bases with exactly this BQ.\n")
+            f.write("## FRAC_GE = fraction of matched bases with BQ >= this value.\n")
+        else:
+            f.write(f"##matched_duplex_bp={n}\n")
+            f.write("## BQ      = min(fwd-strand BQ, rev-strand BQ) of a duplex base-pair whose two strands both\n")
+            f.write("##           match the reference; taken after --trim_ends/--indels_window masking (masked\n")
+            f.write("##           bases have BQ 0) and before the --min_bq gate.\n")
+            f.write("## COUNT   = matched base-pairs with exactly this BQ.\n")
+            f.write("## FRAC_GE = fraction of matched base-pairs with BQ >= this value on both strands.\n")
         f.write("BQ\tCOUNT\tFRAC_GE\n")
         for bq in range(hi):
             f.write(f"{bq}\t{hist[bq]}\t{round(float(frac_ge[bq]), 6)}\n")
 
-    plot_bq_cumulative(frac_ge, n, pdf, sample, contig, min_bq)
-    utilib.cprint(f"Duplex BQ profile ({contig}, {n:,} matched base-pairs) saved to: "
+    plot_bq_cumulative(frac_ge, n, pdf, sample, contig, min_bq, collapsed)
+    what = "read bases" if collapsed else "base-pairs"
+    utilib.cprint(f"{'Read' if collapsed else 'Duplex'} BQ profile ({contig}, {n:,} matched {what}) saved to: "
                   f"{os.path.basename(tsv)} {os.path.basename(pdf)}")
     return tsv, pdf
 
 
-def plot_bq_cumulative(frac_ge, n, out_pdf, sample, contig, min_bq):
-    """Single curve: fraction of matched duplex base-pairs with both strands BQ >= X."""
+def plot_bq_cumulative(frac_ge, n, out_pdf, sample, contig, min_bq, collapsed=False):
+    """Single curve: fraction of matched duplex base-pairs with both strands BQ >= X
+    (collapsed: fraction of matched read bases with BQ >= X)."""
     hi = len(frac_ge)
     x = np.arange(hi)
 
@@ -138,13 +158,18 @@ def plot_bq_cumulative(frac_ge, n, out_pdf, sample, contig, min_bq):
                             textcoords="offset points", ha=ha, va=va,
                             fontsize=10, color=COLOR_TEXT_SECONDARY)
         else:
-            ax.text(0.5, 0.5, f"No matched duplex base-pairs on {contig}", transform=ax.transAxes,
-                    ha="center", va="center", color=COLOR_TEXT_SECONDARY)
+            ax.text(0.5, 0.5, f"No matched {'read bases' if collapsed else 'duplex base-pairs'} on {contig}",
+                    transform=ax.transAxes, ha="center", va="center", color=COLOR_TEXT_SECONDARY)
 
         ax.set_xlabel("BQ threshold (X)")
-        ax.set_ylabel("Fraction with both strands BQ ≥ X")
-        ax.set_title(f"{sample} -- cumulative duplex BQ ({contig}, matched base-pairs, n={n:,})",
-                     color=COLOR_TEXT_PRIMARY, fontsize=12)
+        if collapsed:
+            ax.set_ylabel("Fraction with BQ ≥ X")
+            ax.set_title(f"{sample} -- cumulative read BQ ({contig}, matched bases, n={n:,})",
+                         color=COLOR_TEXT_PRIMARY, fontsize=12)
+        else:
+            ax.set_ylabel("Fraction with both strands BQ ≥ X")
+            ax.set_title(f"{sample} -- cumulative duplex BQ ({contig}, matched base-pairs, n={n:,})",
+                         color=COLOR_TEXT_PRIMARY, fontsize=12)
         ax.set_xlim(0, hi - 1)
         ax.set_xticks(list(range(0, 85, 10)) + list(range(85, hi, 5)))
         ax.tick_params(axis="x", labelsize=9, labelrotation=90)
