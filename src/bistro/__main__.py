@@ -13,19 +13,16 @@ from . import caller, arglib, utilib, sharelib, normcountlib, cosmiclib
 def main():
     parser,options = arglib.parse_args(program_version=__version__)
     if options.sub == "preprocess":  # extract candidate mutations from CCS reads
-        germline_vcf = options.germline_vcf or []
         utilib.check_num_threads(options.threads)
         utilib.check_inputs_preprocess(
             options.bam,
             options.ref,
             options.out_dir,
-            germline_vcf,
             options.low_complexity_regions,
         )
         caller.main(
             options.bam,
             options.ref,
-            germline_vcf,
             options.out_dir,
             options.sample,
             options.region,
@@ -40,12 +37,10 @@ def main():
             options.indels_window,
             options.mismatch_window_len,
             options.min_ec,
-            options.min_rq,
-            options.max_softclipping, 
+            options.max_softclipping,
             options.z_prob,
             options.check_mem_usage,
             options.do_not_collapse,
-            options.min_gq,
             options.min_depth,
             options.low_complexity_regions
         )

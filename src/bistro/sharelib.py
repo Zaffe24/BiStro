@@ -32,7 +32,7 @@ COLS = [
 # Mutation type codes from the bistro caller
 ANN_DICT = {"z":"RDM",   # random non-mutated site
             "m":"MSM",   # mismatch (QB artefact)
-            "g":"GRM",   # germline variant
+            "g":"GRM",   # germline variant (assigned by cross-sample recurrence in annotate_muts)
             "d":"DNM"}   # de novo / somatic mutation
 
 

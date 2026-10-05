@@ -25,7 +25,6 @@ def discard_low_qual_read(read: pysam.AlignedSegment,
                     report:reportlib.METRICS,
                     min_mapq,
                     min_ec,
-                    min_rq,
                     min_qlen,
                     max_qlen,
                     max_softclipping,
@@ -39,11 +38,6 @@ def discard_low_qual_read(read: pysam.AlignedSegment,
     elif read.mapping_quality < min_mapq:
         report.num_discarded += 1
         report.disc_mapq_qual += 1
-        return True
-    
-    elif read.get_tag("rq") < min_rq:
-        report.num_discarded += 1
-        report.disc_mean_qual += 1
         return True
     
     elif read.get_tag("ec") < min_ec:
@@ -142,8 +136,7 @@ def process_mutations(read1:pysam.AlignedSegment,
                       seq1, seq2, qual1, qual2,
                       mismatch_window_len, contig,
                       zmw, fasta,
-                      aln1, aln2,
-                      germ_positions
+                      aln1, aln2
                       ):
 
     output = []
@@ -162,12 +155,6 @@ def process_mutations(read1:pysam.AlignedSegment,
             triplet = fasta[r -1 : r+2]
             t = list_type[n]
 
-            if r in germ_positions:
-                if t == "m":
-                    continue
-                else:
-                    t = "g"
-                    
             p1 = list_qpos1[n]
             p2 = list_qpos2[n]
 

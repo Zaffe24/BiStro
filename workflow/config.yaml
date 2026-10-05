@@ -9,10 +9,6 @@ input:
   fasta: "path/to/reference.fa.gz"      # reference genome, bgzip-compressed + indexed
   output_directory: "path/to/output/"
 
-run_deepvariant: False
-deepvariant_setup: ""    # shell snippet to make `deepvariant` available (module load / singularity bind), leave blank if not needed
-deepvariant_cmd: "deepvariant"
-
 bistro_setup: ""         # shell snippet to activate BiStro's environment before each rule, e.g. "conda activate bistro"
 bistro_cmd: "python -m bistro"
 
@@ -22,7 +18,6 @@ exclude_regions: ""      # e.g. "chrM" -- exclude these contigs
 # Passed straight through to `bistro preprocess`. See `bistro preprocess --help`.
 call_preprocess:
   low_complexity_regions: ""   # optional: BED of low-complexity regions to mask (e.g. sdust output)
-  min_gq: 20
   min_mapq: 60
   min_sequence_identity: .99
   min_bq: 93
@@ -33,7 +28,6 @@ call_preprocess:
   indels_window: 10
   mismatch_window_len: 50
   min_ec: 5
-  min_rq: .99
   max_softclipping: .2
   z_prob: 1000000
   check_mem_usage: 100000
@@ -59,12 +53,6 @@ call_cosmic:
   top:
 
 custom_resources:
-  call_deepvariant:
-    mem_mb: 36000
-    runtime: 360
-    threads: 32
-    partition: "short"
-
   call_preprocess:
     mem_mb: 44000
     runtime: 360

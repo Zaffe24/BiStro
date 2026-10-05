@@ -75,8 +75,6 @@ Pre-processes single-strand CCS reads into candidate mutation calls.
 |---|---|---|
 | `-i, --bam` *(required)* | -- | BAM file with single-strand CCS reads aligned via `pbmm2 align --preset CCS`. |
 | `-r, --ref` *(required)* | -- | Reference genome FASTA file. |
-| `-g, --germline_vcf` | `None` | (Deprecated) VCF file with germline mutations. Somatic mutations will not be called at these positions. |
-| `--min_gq` | `20` | (Deprecated) Minimum Genotype Quality used to flag positions with germline variants. |
 | `-o, --out_dir` *(required)* | -- | Output directory to write the results. |
 | `-s, --sample` | `TrySample` | Sample name to be used in the output files. |
 | `--low_complexity_regions` | `None` | BED file of intervals to exclude from the mutation and context outputs (e.g. repeat/low-complexity regions). See `scripts/create_lcr_bed.sh` |
@@ -93,7 +91,6 @@ Pre-processes single-strand CCS reads into candidate mutation calls.
 | `--indels_window` | `10` | Window size for indel filtering: indels within this window around a candidate SBS are used to filter it out. |
 | `--mismatch_window_len` | `20` | Window size for mismatch filtering: mutations falling within this window from a mismatch are flagged. |
 | `--min_ec` | `5` | Minimum effective coverage (EC) for a candidate variant to be considered. |
-| `--min_rq` | `0.99` | Minimum read quality (RQ) for reads to be considered. |
 | `--max_softclipping` | `0.2` | Maximum proportion of soft-clipped bases allowed in a read. |
 | `--z_prob` | `0` | Debug feature: set to `1000000` to randomly record a reference base pair with probability 1/1000000, for error-model estimation. `0` disables it. |
 | `--check_mem_usage` | `10000` | Debug feature: how often (in processed ZMW duplexes) to check memory usage. `0` disables the check. |
@@ -220,15 +217,7 @@ Computes the cosine similarity of a BiStro SBS96 spectrum against COSMIC signatu
 ## Running the full pipeline with Snakemake
 
 The `workflow/` directory holds a Snakemake pipeline that runs all four stages
-(plus an optional DeepVariant germline-calling step) across every sample listed
-in a samples TSV. The TSV must be formatted as {path_to_bam}\t{sample}, as shown [here](https://github.com/Zaffe24/BiStro/blob/main/tests/data/example_input.tsv).
-
-The DeepVariant step feeds `bistro preprocess --germline_vcf`, but since
-`bistro somatic` already reclassifies any DNM recurring across samples as
-germline (see [`bistro somatic`](#bistro-somatic) above), it is redundant for
-the multi-sample use case the pipeline is built around; we don't recommend
-enabling it. It remains useful only if you need calls for a single sample with
-no other samples to cross-check against.
+across every sample listed in a samples TSV. The TSV must be formatted as {path_to_bam}\t{sample}, as shown [here](https://github.com/Zaffe24/BiStro/blob/main/tests/data/example_input.tsv).
 
 1. Copy the template config and **fill in your paths and parameters**:
    ```bash
