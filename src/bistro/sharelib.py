@@ -29,11 +29,11 @@ COLS = [
 ]
 
 
-# Mutation type codes from the bistro caller
+# Mutation type codes from the bistro caller, mapped to their default annotation
 ANN_DICT = {"z":"RDM",   # random non-mutated site
             "m":"MSM",   # mismatch (QB artefact)
             "g":"GRM",   # germline variant (assigned by cross-sample recurrence in annotate_muts)
-            "d":"DNM"}   # de novo / somatic mutation
+            "x":"DNM"}   # ds-mutation: de novo unless annotate_muts reclassifies it
 
 
 
@@ -144,20 +144,20 @@ def flag_zmw_with_multiple_dnm(df, max_muts_per_duplex):
     # rejects, a ZMW's DNM tally can include calls that the pileup would separately reject as
     # FPD, which can pull that ZMW's genuine DNMs down with them.
     to_flag = get_zmw_with_multiple_dnm(df, max_muts_per_duplex)
-    df.loc[(df["zmw"].isin(to_flag)) & (df["annotation"] == ANN_DICT["d"]), "annotation"] = "FPD"
+    df.loc[(df["zmw"].isin(to_flag)) & (df["annotation"] == ANN_DICT["x"]), "annotation"] = "FPD"
     return df
 
 
 def annotate_muts(df, thr_shared):
-    # Default annotation from type code; then upgrade de novo (d) mutations that appear
+    # Default annotation from type code (ds-mutation x -> DNM); then upgrade x mutations that appear
     # in >= thr_shared other samples to GRM — recurrence across organisms implies germline.
     # The single-sample path has no "shared" column: there is nothing to be shared with.
     df["annotation"] = df["type"].map(ANN_DICT)
     if "shared" in df.columns:
-        df.loc[(df.type == "d") & (df.shared >= thr_shared),"annotation"] = ANN_DICT["g"]
+        df.loc[(df.type == "x") & (df.shared >= thr_shared),"annotation"] = ANN_DICT["g"]
 
     ### flag de novo mutations with any mismatch in the QB window (n_mis > 0) as false positives
-    df.loc[(df["n_mis"] > 0) & (df["annotation"] == ANN_DICT["d"]), "annotation"] = "FPD"
+    df.loc[(df["n_mis"] > 0) & (df["annotation"] == ANN_DICT["x"]), "annotation"] = "FPD"
     return df
 
 
@@ -227,7 +227,7 @@ def flag_fp_denovo(df, other_bams, min_mapq, min_baseq, min_alt_support, min_alt
     if not other_bams:
         return df
 
-    dnm = df.loc[df.annotation == ANN_DICT["d"]]
+    dnm = df.loc[df.annotation == ANN_DICT["x"]]
     if dnm.empty:
         return df
 
@@ -533,7 +533,7 @@ def main(all_muts, thr_shared, max_muts_per_duplex, nproc, reference,
         df_mut = flag_zmw_with_multiple_dnm(df_mut, max_muts_per_duplex)
 
         denominator = get_single_sample_depth(context_bed)
-        numerator = len(df_mut.loc[df_mut.annotation == ANN_DICT["d"]])
+        numerator = len(df_mut.loc[df_mut.annotation == ANN_DICT["x"]])
 
         cl1, cl2 = poisson_rate_cl(numerator,denominator)
         rate =  numerator/denominator if denominator > 0 else 0

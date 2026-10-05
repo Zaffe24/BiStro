@@ -6,8 +6,9 @@
 #   taking every sample together: runs the `somatic` subcommand for shared
 #   callable space, cross-sample/cross-read false positive reclassification,
 #   and per-sample mutation rate) -> call_sbs96 (per-sample
-#   trinucleotide-corrected SBS96 spectrum) -> call_cosmic (per-sample cosine
-#   similarity to COSMIC signatures). See rule `all` for the final target.
+#   trinucleotide-corrected SBS96 spectrum) -> call_cosmic (ONE rule taking
+#   every sample together: two-tier COSMIC signature attribution, grouped by
+#   the samples TSV's optional GROUP column). See rule `all` for the final target.
 # ---------------------------------------------------------------------------
 
 # No hardcoded default: always invoke with --configfile pointing at your copy
@@ -54,6 +55,7 @@ def get_path(*files):
 
 
 def load_samples(input_table):
+    # BAM<TAB>SAMPLE[<TAB>GROUP]; GROUP is only read by `bistro cosmic`.
     df = pd.read_csv(input_table, sep="\t", header=None, index_col=1, comment="#")
     d = {ind: el[0] for ind, el in df.iterrows()}
     return list(d.keys()), d
@@ -86,22 +88,9 @@ def extra_preprocess(category):
     return extra
 
 
-def extra_cosmic():
+def extra_args(category):
     extra = ""
-    for key in ("signatures", "column", "top", "sign_file"):
-        value = config["call_cosmic"][key]
-        if value is None or value is False or value == "":
-            continue
-        extra += f" --{key}"
-        if value is not True:
-            extra += f" {value}"
-
-    return extra
-
-
-def extra_sbs96():
-    extra = ""
-    for key, value in config["call_sbs96"].items():
+    for key, value in config[category].items():
         if value is None or value is False or value == "":
             continue
         extra += f" --{key}"
@@ -116,17 +105,22 @@ def extra_sbs96():
 SAMPLES, BAM_BY_SAMPLE = load_samples(config["input"]["samples_tsv"])
 OUT_DIR = config["input"]["output_directory"]
 REFERENCE = config["input"]["fasta"]
+ATTR_DIR = get_path(OUT_DIR, "attribution")
+
+# Fail at DAG build, not hours later in the last rule.
+if not config["call_cosmic"].get("genome"):
+    raise ValueError("config: call_cosmic.genome is required (SigProfilerAssignment genome build, e.g. mm39 or GRCh38)")
 
 
 # ---------------------------------------------------------------------------
 # Rules
 # ---------------------------------------------------------------------------
 
-localrules: all, call_cosmic,
+localrules: all,
 
 rule all:
     input:
-        expand(get_path(OUT_DIR, "{sample}.SBS_cosine_similarity.tsv"), sample=SAMPLES),
+        get_path(ATTR_DIR, "final_attribution.tsv"),
         expand(get_path(OUT_DIR, "{sample}.normcounts.tsv"), sample=SAMPLES),
 
 
@@ -136,6 +130,9 @@ rule call_preprocess:
     output:
         muts=get_path(OUT_DIR, "{sample}.muts.bed.gz"),
         ctx=get_path(OUT_DIR, "{sample}.context.bed.gz"),
+        # Diagnostic only: duplex BQ profile on one contig (not consumed downstream).
+        bq_pdf=get_path(OUT_DIR, "{sample}.duplex_bq_cumulative.pdf"),
+        bq_tsv=get_path(OUT_DIR, "{sample}.duplex_bq_cumulative.tsv"),
     log:
         get_path(OUT_DIR, "logs", "{sample}_call_preprocess.log"),
     threads: lambda wildcards, attempt: get_threads("call_preprocess", attempt),
@@ -232,7 +229,7 @@ rule call_sbs96:
     params:
         cmd=config["bistro_cmd"],
         fasta=REFERENCE,
-        extra = extra_sbs96()
+        extra = extra_args("call_sbs96")
     shell:
         """
         set -euo pipefail
@@ -251,14 +248,24 @@ rule call_sbs96:
 
 rule call_cosmic:
     input:
-        rules.call_sbs96.output,
+        normcounts=expand(rules.call_sbs96.output[0], sample=SAMPLES),
+        # Same table as the BAMs: its optional 3rd column GROUP drives tier-1 validation.
+        groups=config["input"]["samples_tsv"],
     output:
-        get_path(OUT_DIR, "{sample}.SBS_cosine_similarity.tsv"),
+        final=get_path(ATTR_DIR, "final_attribution.tsv"),
+        cis=get_path(ATTR_DIR, "tier1_signature_CIs.tsv"),
+        validation=get_path(ATTR_DIR, "tier1_validation_summary.tsv"),
     log:
-        get_path(OUT_DIR, "logs", "{sample}_call_cosmic.log"),
+        get_path(OUT_DIR, "logs", "call_cosmic.log"),
+    threads: lambda wildcards, attempt: get_threads("call_cosmic", attempt),
+    resources:
+        mem_mb=lambda wildcards, attempt: get_mem_mb("call_cosmic", attempt),
+        runtime=config["custom_resources"]["call_cosmic"]["runtime"],
+        partition=config["custom_resources"]["call_cosmic"]["partition"],
     params:
         cmd=config["bistro_cmd"],
-        extra=extra_cosmic(),
+        out_dir=ATTR_DIR,
+        extra=extra_args("call_cosmic"),
     shell:
         """
         set -euo pipefail
@@ -266,9 +273,11 @@ rule call_cosmic:
 
         cd $HOME
         {params.cmd} cosmic \
-            -i {input} \
-            {params.extra} \
-            --out {output}
+            -i {input.normcounts} \
+            --groups {input.groups} \
+            --out_dir {params.out_dir} \
+            -t {threads} \
+            {params.extra}
         """
 
 

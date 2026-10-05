@@ -42,7 +42,8 @@ def main():
             options.check_mem_usage,
             options.do_not_collapse,
             options.min_depth,
-            options.low_complexity_regions
+            options.low_complexity_regions,
+            options.bq_profile_contig,
         )
     elif options.sub == "somatic":  # call true somatic mutations across samples
         utilib.check_num_threads(options.threads)
@@ -73,15 +74,23 @@ def main():
             options.preset_genome,
         )
 
-    elif options.sub == "cosmic":
-        utilib.check_inputs_cosmic(options.input, options.sign_file)
+    elif options.sub == "cosmic":  # two-tier COSMIC signature attribution across samples
+        utilib.check_num_threads(options.threads)
+        utilib.check_inputs_cosmic(options.input, options.groups)
         cosmiclib.main(
             options.input,
-            options.sign_file,
-            options.signatures,
+            options.groups,
+            options.out_dir,
+            options.genome,
+            options.cosmic_version,
             options.column,
-            options.out,
-            options.top,
+            options.nboot,
+            options.min_samples,
+            options.merge_groups_tier1,
+            options.bootstrap_tier2,
+            options.poisson,
+            options.seed,
+            options.threads,
         )
 
     else:

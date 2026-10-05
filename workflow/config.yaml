@@ -5,7 +5,7 @@
 # ---------------------------------------------------------------------------
 
 input:
-  samples_tsv: "path/to/samples.tsv"    # TSV, no header: <path/to/sample.bam>\t<sample_id>
+  samples_tsv: "path/to/samples.tsv"    # TSV, no header: <path/to/sample.bam>\t<sample_id>[\t<group>] (group: optional, used by call_cosmic)
   fasta: "path/to/reference.fa.gz"      # reference genome, bgzip-compressed + indexed
   output_directory: "path/to/output/"
 
@@ -46,11 +46,17 @@ call_sbs96:
   preset_genome:    # optional, e.g. GRCh38 / GRCm39 -- skips the whole-genome FASTA scan
 
 # Passed straight through to `bistro cosmic`. See `bistro cosmic --help`.
+# Groups come from input.samples_tsv's optional 3rd column (none -> one group).
 call_cosmic:
-  sign_file:        # optional -- defaults to the COSMIC v3.6 GRCh38 signatures bundled with BiStro
-  signatures:
-  column:           # optional -- defaults to Human_normfrac
-  top:
+  genome: ""                # REQUIRED: SigProfilerAssignment build, one of GRCh37 GRCh38 mm9 mm10 mm39 rn6 rn7
+  cosmic_version: 3.6
+  column: normcounts        # normcounts.tsv column fitted (normcounts = opportunity-corrected; counts = raw)
+  nboot: 1000
+  min_samples: 3            # validated if lower 95% CI > 0 in >= this many samples of the group
+  merge_groups_tier1: False # True: tier 1 on one pooled pseudo-sample per group (min_samples ignored)
+  bootstrap_tier2: False    # True: also bootstrap tier 2 for CIs on the final exposures
+  poisson: False
+  seed: 12345
 
 custom_resources:
   call_preprocess:
@@ -69,4 +75,10 @@ custom_resources:
     mem_mb: 8000
     runtime: 120
     threads: 20
+    partition: "short"
+
+  call_cosmic:
+    mem_mb: 5000
+    runtime: 60
+    threads: 8
     partition: "short"

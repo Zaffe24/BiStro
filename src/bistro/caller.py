@@ -6,7 +6,8 @@ mismatch, or double-strand (de novo) substitution, tracks per-position read
 depth, and writes the resulting mutation and context records to per-contig
 BED fragments that main() then merges into the sample's .muts.bed.gz /
 .context.bed.gz outputs. The `somatic` subcommand (sharelib.py) later decides
-which of these candidates are true de novo mutations.
+which of these double-strand candidates (TYPE x) are de novo or germline.
+On one contig the walk also records a duplex base-quality profile (bqlib.py).
 """
 
 # import sys
@@ -26,7 +27,7 @@ from functools import partial
 import multiprocessing as mp
 pysam.set_verbosity(0)
 
-from . import reportlib, utilib, bamlib, vcflib, contiglib, covlib
+from . import reportlib, utilib, bamlib, vcflib, contiglib, covlib, bqlib
 #from reportlib import METRICS
 
 def call_somatic_mutations(region_tuple,
@@ -45,7 +46,8 @@ def call_somatic_mutations(region_tuple,
                            z_prob,
                            check_mem_usage,
                            do_not_collapse,
-                           min_depth):
+                           min_depth,
+                           bq_profile_contig):
 
     #output_dict = dict()
     wrk = mp.current_process().name
@@ -71,10 +73,13 @@ def call_somatic_mutations(region_tuple,
     depth = np.zeros(region_len, dtype=np.uint16)
     zmw_dict = dict()
     chr_mutations = []
+    # duplex BQ profile: only the worker handling bq_profile_contig records it
+    bq_hist = bqlib.new_histogram() if CONTIG == bq_profile_contig else None
 
     with pysam.AlignmentFile(bam, "rb") as bam_file, \
     pysam.FastaFile(reference) as fasta:
         ref_seq = fasta.fetch(CONTIG).upper()
+        ref_arr = np.frombuffer(ref_seq.encode("ascii"), dtype=np.uint8) if bq_hist is not None else None
 
         for ss_strand in bam_file.fetch(CONTIG, START, END):
             # ------------------------------------------------
@@ -123,6 +128,9 @@ def call_somatic_mutations(region_tuple,
             #ln1, ln2 = read1.query_length, read2.query_length
             aln1, aln2 = read1.get_aligned_pairs(matches_only=True), read2.get_aligned_pairs(matches_only=True)
             len1, len2 = len(aln1), len(aln2)
+
+            if bq_hist is not None:
+                bqlib.add_duplex(bq_hist, aln1, aln2, s1, s2, q1, q2, ref_arr)
 
             ####################
             # if report.num_zmw in np.arange(49000, 50000):
@@ -195,7 +203,7 @@ def call_somatic_mutations(region_tuple,
                         list_qpos1+=[qpos1]
                         list_qpos2+=[qpos2]
                         list_ref1+=[ref1]
-                        list_type+=["d"]
+                        list_type+=["x"]
 
                         #triplet = ref_seq[ref1 -1 : ref1+2] 
                         #mut_dict_per_read[ref1]=[CONTIG,ref1,ref1+1,zmw,triplet,ref_base,b1,q1[qpos1],qpos1,ln1,b2, q2[qpos2], qpos2, ln2, "d"]
@@ -246,7 +254,7 @@ def call_somatic_mutations(region_tuple,
         #utilib.cprint(f"REPORT OF {CONTIG}\n", color="yellow")
         utilib.cprint(f"{report}\n", color="yellow")
 
-    return report, chr_mutations, depth
+    return report, chr_mutations, depth, bq_hist
 
 
 def write_frags(mut_list, ctx_list, region_tuple, reference, out_dir, sample, min_depth):
@@ -282,17 +290,26 @@ def main(bam,
             check_mem_usage,
             do_not_collapse,
             min_depth,
-            subtract_bed):
+            subtract_bed,
+            bq_profile_contig=None):
 
     checkpoints = range(0, 1000_000, check_mem_usage) if check_mem_usage>0 else []
     clock_start = time.time() / 60
 
     # [(contig, start, end), ...] to call mutations on
     contigs_list = contiglib.get_contig_list(reference, region, exclude)
+    contigs = [c for c, _, _ in contigs_list]
     if region:
         utilib.cprint(f"Calling Mutations only on Chromosomes: {region}.", color="green")
     if exclude:
         utilib.cprint(f"Excluding Chromosomes: {exclude}", color="green")
+
+    # Duplex BQ profile defaults to the first analysed contig (FASTA/.fai order).
+    if bq_profile_contig is None:
+        bq_profile_contig = contigs[0]
+    elif bq_profile_contig not in contigs:
+        utilib.cprint(f"ERROR: --bq_profile_contig '{bq_profile_contig}' is not among the analysed contigs (check --region / --exclude).", color="red")
+        utilib.exit(1)
 
     # Bind everything except region_tuple; map the rest over the contigs.
     # out_dir/sample are bound too, so each worker can write its own fragments.
@@ -312,7 +329,8 @@ def main(bam,
                     z_prob=z_prob,
                     check_mem_usage=checkpoints,
                     do_not_collapse=do_not_collapse,
-                    min_depth = min_depth
+                    min_depth = min_depth,
+                    bq_profile_contig=bq_profile_contig
                     )
 
     with mp.Pool(processes=nproc) as pool:
@@ -323,15 +341,17 @@ def main(bam,
     reports   = [r[0] for r in results]
     mut_list = [r[1] for r in results]   # already in contig order
     ctx_list = [r[2] for r in results]
+    bq_hist = next(r[3] for r in results if r[3] is not None)
     merged_report = reportlib.merge_reports(reports)
     utilib.cprint(merged_report)
     print("")
-    
+
     del results
+
+    bqlib.write_bq_profile(bq_hist, out_dir, sample, bq_profile_contig, min_bq)
 
     # Launch the raw-read coverage scan now; it only needs the BAM and runs in
     # the background, overlapping fragment writing + assembly below.
-    contigs = [c for c, _, _ in contigs_list]
     mosdepth_run = covlib.start_mosdepth(bam, out_dir, sample, contigs, threads=nproc)
 
     worker2 = partial(write_frags,

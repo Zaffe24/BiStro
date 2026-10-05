@@ -13,6 +13,7 @@ dependencies = [
     "scipy",
     "matplotlib",
     "psutil",
+    "SigProfilerAssignment",
 ]
 
 [project.urls]
@@ -27,6 +28,3 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
 where = ["src"]
-
-[tool.setuptools.package-data]
-"bistro.data" = ["*.txt"]
