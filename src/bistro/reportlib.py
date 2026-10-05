@@ -17,7 +17,6 @@ class METRICS:
     disc_no_primary: int = 0 ## read is flagged as secondary / supplemetary
     disc_min_qlen: int = 0 ## read length shorter than min threshold
     disc_max_qlen: int = 0 ## read length higher tha nmax threshold
-    disc_mean_qual: int = 0 ## read mean quality too low
     disc_mapq_qual: int = 0 ## read mapq quality too low
     disc_min_ec: int = 0 ## read not having enough full passes
     disc_max_soft:int = 0 ## proprotion of softclipped read is too high
@@ -27,7 +26,6 @@ class METRICS:
 
     callable_bps: int = 0 ## base-pairs that were investigated
     total_length_ref: int = 0 ## total length of reference genome
-    germ_positions: int = 0
     num_som_ds: int = 0
     num_som_ss: int = 0
 
@@ -70,11 +68,10 @@ class METRICS:
                  f"Total reads discarded:\t\t{self.num_discarded} ({self.gp(self.num_discarded,self.num_reads)}%)",
                  f"\tNot-primary reads:\t{self.disc_no_primary} ({self.gp(self.disc_no_primary, self.num_discarded)}%)",
                  f"\tLow Mapping Qual < {self.filtering_params[0]}:\t{self.disc_mapq_qual} ({self.gp(self.disc_mapq_qual,self.num_discarded)}%)",
-                 f"\tMean Read Qual < {self.filtering_params[9]}:\t{self.disc_mean_qual} ({self.gp(self.disc_mean_qual, self.num_discarded)}%)",
                  f"\tMean subpasses < {self.filtering_params[8]}:\t{self.disc_min_ec} ({self.gp(self.disc_min_ec, self.num_discarded)}%)",
                  f"\tRead length < {self.filtering_params[3]}:\t{self.disc_min_qlen} ({self.gp(self.disc_min_qlen, self.num_discarded)}%)",
                  f"\tRead length > {self.filtering_params[4]}:\t{self.disc_max_qlen} ({self.gp(self.disc_max_qlen, self.num_discarded)}%)",
-                 f"\tSoftclipped > {round(100*self.filtering_params[10])}%:\t{self.disc_max_soft} ({self.gp(self.disc_max_soft, self.num_discarded)}%)",
+                 f"\tSoftclipped > {round(100*self.filtering_params[9])}%:\t{self.disc_max_soft} ({self.gp(self.disc_max_soft, self.num_discarded)}%)",
                  f"\tRead divergence > {round(100* (1 - self.filtering_params[1]))}%:\t{self.disc_min_identity} ({self.gp(self.disc_min_identity, self.num_discarded)}%)",
                  f"\tLack ZMW complement:\t{self.disc_lack_compl} ({self.gp(self.disc_lack_compl, self.num_discarded)}%)",
                  "",

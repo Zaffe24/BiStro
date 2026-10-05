@@ -1,6 +1,6 @@
 """
 Shared helpers used across all BiStro subcommands: colored console logging,
-memory-usage reporting, and the up-front input validation (BAM/FASTA/VCF/BED
+memory-usage reporting, and the up-front input validation (BAM/FASTA/BED
 existence, indexing, and readability) that runs before each subcommand.
 """
 
@@ -64,9 +64,9 @@ def check_num_threads(thread_count: int):
         cprint(f"Using {thread_count} threads", color="green")
 
 
-def check_inputs_preprocess(bam, ref, out_dir, germline_vcf, low_complexity_regions):
+def check_inputs_preprocess(bam, ref, out_dir, low_complexity_regions):
     """
-    Validate that the BAM, REF, OUT and (optional) GERM inputs exist and are
+    Validate that the BAM, REF and OUT inputs exist and are
     not corrupted before launching the pipeline. Exits BiStro on any failure.
 
     When a low-complexity BED is supplied it is subtracted from the outputs via
@@ -111,21 +111,6 @@ def check_inputs_preprocess(bam, ref, out_dir, germline_vcf, low_complexity_regi
     if not os.access(out_dir, os.W_OK):
         cprint(f"ERROR: Output directory is not writable: {out_dir}", color="red")
         exit(1)
-
-    # --- GERM (optional) ---------------------------------------------------
-    if germline_vcf:
-        if not os.path.isfile(germline_vcf):
-            cprint(f"ERROR: Germline VCF not found: {germline_vcf}", color="red")
-            exit(1)
-        try:
-            with pysam.VariantFile(germline_vcf) as vcf:
-                if vcf.index is None:
-                    cprint(f"ERROR: Germline VCF index (.tbi/.csi) not found for: {germline_vcf}", color="red")
-                    exit(1)
-                _ = vcf.header
-        except (ValueError, OSError) as e:
-            cprint(f"ERROR: Germline VCF is corrupted or unreadable: {germline_vcf} ({e})", color="red")
-            exit(1)
 
     # --- LOW-COMPLEXITY / SUBTRACT BED (optional) --------------------------
     if low_complexity_regions:

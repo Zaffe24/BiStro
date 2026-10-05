@@ -64,22 +64,6 @@ def parse_args(program_version, arguments=sys.argv[1:]):
         help="Reference genome FASTA file",
     )
     parser_preprocess.add_argument(
-        "-g",
-        "--germline_vcf",
-        required=False,
-        nargs='?',
-        default=None,
-        const=None,
-        help="VCF file with germline mutations. Somatic mutations will not be called at these positions.",
-    )
-    parser_preprocess.add_argument(
-        "--min_gq",
-        type=float,
-        required=False,
-        default=20,
-        help="Minimum threshold for Genotype Quality to be used to flag postions with Germline variants."
-        )
-    parser_preprocess.add_argument(
         "-o",
         "--out_dir",
         type=str,
@@ -186,13 +170,6 @@ def parse_args(program_version, arguments=sys.argv[1:]):
         default=5,
         required=False,
         help="Minimum number of effective coverage (EC) for a candidate variant to be considered.",
-    )
-    parser_preprocess.add_argument(
-        "--min_rq",
-        type=float,
-        default=0.99,
-        required=False,
-        help="Minimum read quality (RQ) for reads to be considered in mutation calling.",
     )
     parser_preprocess.add_argument(
         "--max_softclipping",

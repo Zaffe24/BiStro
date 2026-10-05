@@ -5,7 +5,7 @@ two production PacBio Revio single-strand CCS duplex samples (`E01`, `F01`).
 
 It is **not** a synthetic/simulated dataset: every read is a real, unmodified
 alignment record (sequence, CIGAR, quality scores, and the BAM tags BiStro
-actually reads: `rq`, `ec`, `np`, `zm`, `sm`, `NM`). Only two things were
+actually reads: `ec`, `np`, `zm`, `sm`, `NM`). Only two things were
 changed relative to the source BAMs:
 
 1. Reads were subset to a handful of ZMWs (duplexes) around two small genomic
@@ -32,6 +32,6 @@ changed relative to the source BAMs:
   should classify these as `GRM`.
 
 Note the dataset is tiny and calling it with BiStro's default QC thresholds
-requires relaxing several of them (mapping quality, base quality, read
-quality, etc.) -- it's meant as a pipeline wiring check, not a statistical
+requires relaxing several of them (mapping quality, base quality, sequence
+identity, etc.) -- it's meant as a pipeline wiring check, not a statistical
 validation.

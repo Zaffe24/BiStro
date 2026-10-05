@@ -1,7 +1,6 @@
 """
-Output I/O for BiStro: reads germline VCF calls to filter out during
-preprocessing, builds the BED headers/column glossaries for the preprocess
-and somatic outputs, and provides the bgzf writers that assemble caller.py's
+Output I/O for BiStro: builds the BED headers/column glossaries for the
+preprocess and somatic outputs, and provides the bgzf writers that assemble caller.py's
 per-contig fragments into the final .muts.bed.gz / .context.bed.gz /
 .shared.muts.bed.gz files.
 """
@@ -19,29 +18,19 @@ from . import utilib, __main__
 import time
 import gzip
 import pandas as pd
-def process_germline_vcf(germline_vcf, region, min_gq):
-    """Reads Germline VCF from DeepVariant and returns a set of positions with germline mutations, to be used for filtering somatic calls."""
-    germline_positions = set()
-    if germline_vcf:
-        with pysam.VariantFile(germline_vcf) as vcf:
-            for record in vcf.fetch(region=region):
-                if record.qual >= min_gq:
-                    germline_positions.add(record.pos - 1) # VCF are 1-based
-    return germline_positions
-
 
 
 def mut_bed_header(sample, reference, filtering_params):
-    
-    min_mapq, min_sequence_identity, min_bq, min_qlen, max_qlen, \
-        trim_percentage, indels_window, mismatch_window_len, min_ec,min_rq, \
-            max_softclipping, min_gq,min_depth, max_depth = filtering_params
 
-    filters = (f"min_mapq={min_mapq};min_rq={min_rq};min_ec={min_ec};"
+    min_mapq, min_sequence_identity, min_bq, min_qlen, max_qlen, \
+        trim_percentage, indels_window, mismatch_window_len, min_ec, \
+            max_softclipping, min_depth, max_depth = filtering_params
+
+    filters = (f"min_mapq={min_mapq};min_ec={min_ec};"
                f"min_qlen={min_qlen};max_qlen={max_qlen};"
                f"max_softclip={max_softclipping};min_identity={min_sequence_identity};"
                f"min_bq={min_bq};trim_pct={trim_percentage};"
-               f"indels_window={indels_window};mismatch_window={mismatch_window_len};min_gq={min_gq};min_depth={min_depth};max_depth={max_depth}")
+               f"indels_window={indels_window};mismatch_window={mismatch_window_len};min_depth={min_depth};max_depth={max_depth}")
 
     return [f"##fileformat=BiStro-bed-v{__main__.__version__}",
             f"##sample={sample}",
@@ -61,7 +50,7 @@ def mut_bed_header(sample, reference, filtering_params):
              "## 8  STRAND_2 rev-strand call, colon-delimited (see sub-fields below)",
              "## 9  NOB      number of non-overlapping bases between the two reads",
              "## 10 N_MIS    mismatches within the QB window (default 20)",
-             "## 11 TYPE     g=ds-germline s=ds-somatic  z=non-mutated random  m=mismatch",
+             "## 11 TYPE     d=ds-somatic  z=non-mutated random  m=mismatch",
              "## 12 DEPTH    read coverage at that position",
              "##",
              "## STRAND_1 / STRAND_2 sub-fields (colon-delimited):",
@@ -189,7 +178,7 @@ def mut_header_shared(samples):
              "## 8  STRAND_2 rev-strand call, colon-delimited (see sub-fields below)",
              "## 9  NOB      number of non-overlapping bases between the two reads",
              "## 10 N_MIS    mismatches within the QB window (default 20)",
-             "## 11 TYPE     g=ds-germline s=ds-somatic  z=non-mutated random  m=mismatch",
+             "## 11 TYPE     d=ds-somatic  z=non-mutated random  m=mismatch",
              "## 12 DEPTH    read coverage at that position",
              "## 13 SHARED    Number of samples in which the mutation is observed",
              "## 14 ANNOTATION    Revised annotation for TYPE categories",
@@ -228,7 +217,7 @@ def mut_header_single(samples):
              "## 8  STRAND_2 rev-strand call, colon-delimited (see sub-fields below)",
              "## 9  NOB      number of non-overlapping bases between the two reads",
              "## 10 N_MIS    mismatches within the QB window (default 20)",
-             "## 11 TYPE     g=ds-germline s=ds-somatic  z=non-mutated random  m=mismatch",
+             "## 11 TYPE     d=ds-somatic  z=non-mutated random  m=mismatch",
              "## 12 DEPTH    read coverage at that position",
              "## 13 ANNOTATION    Revised annotation for TYPE categories",
              "##",

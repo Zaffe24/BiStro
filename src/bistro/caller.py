@@ -32,7 +32,6 @@ from . import reportlib, utilib, bamlib, vcflib, contiglib, covlib
 def call_somatic_mutations(region_tuple,
                            bam,
                            reference,
-                           germline_vcf,
                            min_mapq,
                            min_sequence_identity,
                            min_bq,
@@ -42,14 +41,12 @@ def call_somatic_mutations(region_tuple,
                            indels_window,
                            mismatch_window_len,
                            min_ec,
-                           min_rq,
-                           max_softclipping, 
+                           max_softclipping,
                            z_prob,
                            check_mem_usage,
                            do_not_collapse,
-                           min_gq,
                            min_depth):
-    
+
     #output_dict = dict()
     wrk = mp.current_process().name
     report = reportlib.METRICS()
@@ -62,9 +59,8 @@ def call_somatic_mutations(region_tuple,
                            indels_window,
                            mismatch_window_len,
                            min_ec,
-                           min_rq,
                            max_softclipping,
-                           min_gq, min_depth
+                           min_depth
                            )
     
     CONTIG, START, END = region_tuple
@@ -75,10 +71,6 @@ def call_somatic_mutations(region_tuple,
     depth = np.zeros(region_len, dtype=np.uint16)
     zmw_dict = dict()
     chr_mutations = []
-
-    germ_positions = set()
-    if germline_vcf:
-        germ_positions = vcflib.process_germline_vcf(germline_vcf, CONTIG, min_gq)
 
     with pysam.AlignmentFile(bam, "rb") as bam_file, \
     pysam.FastaFile(reference) as fasta:
@@ -92,8 +84,8 @@ def call_somatic_mutations(region_tuple,
             #strand, zmw= ss_strand.query_name.split("/")[-1], ss_strand.get_tag("zm")
             #print(ss_strand.query_name, strand, zmw)
 
-            if bamlib.discard_low_qual_read(ss_strand, report, min_mapq, min_ec, 
-                                     min_rq, min_qlen, max_qlen, max_softclipping, 
+            if bamlib.discard_low_qual_read(ss_strand, report, min_mapq, min_ec,
+                                     min_qlen, max_qlen, max_softclipping,
                                      min_sequence_identity):
                 continue
             # ------------------------------------------------
@@ -231,8 +223,7 @@ def call_somatic_mutations(region_tuple,
                                                     s1, s2, q1, q2, 
                                                     mismatch_window_len, CONTIG,
                                                     zmw, ref_seq,
-                                                    aln1, aln2,
-                                                    germ_positions)
+                                                    aln1, aln2)
             
             if mutations_in_read:
                 chr_mutations += mutations_in_read
@@ -272,7 +263,6 @@ def write_frags(mut_list, ctx_list, region_tuple, reference, out_dir, sample, mi
 
 def main(bam,
             reference,
-            germline_vcf,
             out_dir,
             sample,
             region,
@@ -287,12 +277,10 @@ def main(bam,
             indels_window,
             mismatch_window_len,
             min_ec,
-            min_rq,
             max_softclipping,
             z_prob,
             check_mem_usage,
             do_not_collapse,
-            min_gq,
             min_depth,
             subtract_bed):
 
@@ -311,7 +299,6 @@ def main(bam,
     worker = partial(call_somatic_mutations,
                     bam=bam,
                     reference=reference,
-                    germline_vcf=germline_vcf,
                     min_mapq=min_mapq,
                     min_sequence_identity=min_sequence_identity,
                     min_bq=min_bq,
@@ -321,12 +308,10 @@ def main(bam,
                     indels_window=indels_window,
                     mismatch_window_len=mismatch_window_len,
                     min_ec=min_ec,
-                    min_rq=min_rq,
                     max_softclipping=max_softclipping,
                     z_prob=z_prob,
                     check_mem_usage=checkpoints,
                     do_not_collapse=do_not_collapse,
-                    min_gq=min_gq,
                     min_depth = min_depth
                     )
 

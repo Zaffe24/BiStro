@@ -1,9 +1,8 @@
 # ---------------------------------------------------------------------------
 # BiStro end-to-end pipeline over the samples listed in
 # config["input"]["samples_tsv"]:
-#   call_deepvariant (per-sample germline calls, optional) -> call_somatic
-#   (per-sample read pre-processing: runs the `preprocess` subcommand to
-#   extract candidate mutations from CCS duplex reads) -> call_rate (ONE rule
+#   call_preprocess (per-sample read pre-processing: runs the `preprocess`
+#   subcommand to extract candidate mutations from CCS duplex reads) -> call_somatic (ONE rule
 #   taking every sample together: runs the `somatic` subcommand for shared
 #   callable space, cross-sample/cross-read false positive reclassification,
 #   and per-sample mutation rate) -> call_sbs96 (per-sample
@@ -117,7 +116,6 @@ def extra_sbs96():
 SAMPLES, BAM_BY_SAMPLE = load_samples(config["input"]["samples_tsv"])
 OUT_DIR = config["input"]["output_directory"]
 REFERENCE = config["input"]["fasta"]
-DEEP_OUT = config["run_deepvariant"]
 
 
 # ---------------------------------------------------------------------------
@@ -132,50 +130,9 @@ rule all:
         expand(get_path(OUT_DIR, "{sample}.normcounts.tsv"), sample=SAMPLES),
 
 
-rule call_deepvariant:
-    input:
-        lambda wc: BAM_BY_SAMPLE[wc.sample],
-    output:
-        get_path(OUT_DIR, "{sample}.germline.vcf.gz"),
-    log:
-        get_path(OUT_DIR, "logs", "{sample}_call_deepvariant.log"),
-    threads: lambda wildcards, attempt: get_threads("call_deepvariant", attempt),
-    resources:
-        mem_mb=lambda wildcards, attempt: get_mem_mb("call_deepvariant", attempt),
-        runtime=config["custom_resources"]["call_deepvariant"]["runtime"],
-        partition=config["custom_resources"]["call_deepvariant"]["partition"],
-    params:
-        out=lambda wc: get_path(OUT_DIR, f"{wc.sample}.germline.vcf"),
-        reference=REFERENCE,
-        region=f"--regions {config['target_regions']}" if config["target_regions"] else "",
-        tmp=lambda wc: get_path(OUT_DIR, wc.sample, "tmp"),
-        deepv_setup=config["deepvariant_setup"],
-        deepv_cmd=config["deepvariant_cmd"],
-    shell:
-        """
-        set -euo pipefail
-        {params.deepv_setup} &>/dev/null
-        exec > {log} 2>&1
-
-        {params.deepv_cmd} --model_type=PACBIO \
-            --ref={params.reference} \
-            --reads={input} \
-            --output_vcf={params.out} \
-            --num_shards={threads} \
-            --sample_name={wildcards.sample} \
-            {params.region}
-
-        bgzip -c {params.out} > {output}
-        tabix -p vcf {output}
-
-        rm -fr {params.tmp}
-        """
-
-
 rule call_preprocess:
     input:
         bam=lambda wc: BAM_BY_SAMPLE[wc.sample],
-        germ=rules.call_deepvariant.output if DEEP_OUT else [],
     output:
         muts=get_path(OUT_DIR, "{sample}.muts.bed.gz"),
         ctx=get_path(OUT_DIR, "{sample}.context.bed.gz"),
@@ -194,7 +151,6 @@ rule call_preprocess:
         target_chr=config["target_regions"],
         exclude_chr=config["exclude_regions"],
         extra=extra_preprocess("call_preprocess"),
-        germline=lambda wc, input: f"--germline_vcf {input.germ}" if DEEP_OUT else "",
     shell:
         """
         set -euo pipefail
@@ -204,7 +160,6 @@ rule call_preprocess:
         cd $HOME
         {params.cmd} preprocess \
             --bam {input.bam} \
-            {params.germline} \
             --ref {params.reference} \
             --out_dir {params.out_dir} \
             --sample {wildcards.sample} \
