@@ -13,3 +13,5 @@ snk_logs/
 tests/run_smoke_test.sh
 roba/
 workflow/snk_*
+
+tests/.tests
