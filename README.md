@@ -1,4 +1,4 @@
-# <img src=".github/Bistro_logo.svg" width="200" align="left">  <br> BiStro v1.0.0
+# <img src=".github/Bistro_logo.svg" width="200" align="left">  <br> BiStro v1.1.0
 <br>
 
 BiStro is a *de novo* single-nucleotide mutation caller for **single-strand CCS duplex** generated via [HiDEF-Seq protocol](https://www.nature.com/articles/s41586-024-07532-8).<br>

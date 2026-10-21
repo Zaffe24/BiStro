@@ -1,6 +1,6 @@
 [project]
 name = "BiStro"
-version = "1.0.0"
+version = "1.1.0"
 description = "Somatic single-base substitution caller for PacBio Revio single-strand CCS duplex reads"
 readme = "README.md"
 requires-python = ">=3.12"

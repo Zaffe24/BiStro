@@ -4,7 +4,7 @@ CLI entry point (`python -m bistro`). Parses the requested subcommand
 (preprocess, somatic, sbs96, cosmic) via arglib, validates its inputs via
 utilib, and dispatches to that subcommand's own main().
 """
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 __author__ = "Pietro Zafferani"
 
 
