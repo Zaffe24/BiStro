@@ -114,6 +114,17 @@ def get_positions(file_path):
     return positions
 
 
+def is_collapsed(mut_bed):
+    # preprocess writes read_mode=collapsed into the ##filters header line of collapsed-mode files.
+    with gzip.open(mut_bed, "rt") as f:
+        for line in f:
+            if not line.startswith("#"):
+                return False
+            if "read_mode=collapsed" in line:
+                return True
+    return False
+
+
 def get_shared_muts(sample_df, sample_mut, all_positions):
     # For each mutation, count how many OTHER samples carry a call at the same position.
     # sum() over boolean Series yields an integer Series (0 = private, N = shared in N others).
@@ -348,6 +359,14 @@ def wrap_worker(mut_bed, intersection, samples_id, all_positions, thr_shared, re
     finally:
         os.unlink(sorted_mut)
     utilib.cprint(f"[MEM][{wrk}][{sample_id}] after mut_df load: {utilib.get_stats()} GB | rows={len(mut_df)}", color="yellow")
+
+    # Collapsed mode only: drop mutation calls whose ALT is carried by fewer than min_alt_support
+    # of this sample's reads, so unconfirmed single-read calls never reach the pileup.
+    if is_collapsed(mut_bed):
+        is_x = mut_df.type == "x"
+        support = mut_df.loc[is_x].groupby("contig_start").zmw.transform("size")
+        mut_df = mut_df.drop(support.index[support < min_alt_support])
+        utilib.cprint(f"[MEM][{wrk}][{sample_id}] after collapsed ALT-support filter (>= {min_alt_support} reads): rows={len(mut_df)}", color="yellow")
 
     # WARNING: iterating all_positions here touches every Python object in the inherited dict,
     # breaking copy-on-write and causing each worker to copy the full dict into its own RSS.
