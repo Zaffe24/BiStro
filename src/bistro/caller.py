@@ -10,50 +10,86 @@ which of these double-strand candidates (TYPE x) are de novo or germline.
 On one contig the walk also records a duplex base-quality profile (bqlib.py).
 
 With --collapsed, reads are not paired: every read that passes the filters is
-its own molecule and is walked on its own (bamlib.walk_collapsed), so there are
+its own molecule and is walked on its own (bamlib.collapsed_walk), so there are
 no single-strand mismatches (TYPE m) and nothing is blacklisted around them.
+
+Efficiency refactor (results identical to the original):
+* One worker per contig does everything for that contig: the walk (vectorised,
+  bamlib.duplex_walk / collapsed_walk), the raw-read coverage that mosdepth used
+  to compute in a second pass over the BAM (covlib.RawCoverage, fed with the reads
+  the worker fetches anyway), the low-complexity + high-coverage mask (applied in
+  memory instead of `bedtools subtract` over the assembled files), and writing its
+  .muts / .context fragments (vectorised text formatting, tabix offsets recorded
+  while writing). Only small summaries go back to the parent; no per-base array
+  is pickled, and there is no second pool.
+* The .context.bed.gz index is written from those offsets (no re-scan by tabix).
+* Contigs are dispatched largest first so the pool stays busy.
 """
 
-# import sys
-# import os
-
-import pysam
-#import pandas as pd
-import numpy as np
-#import psutil
-#from datetime import datetime
-#from array import array
-#from dataclasses import dataclass
 import os
-import random
 import time
-from functools import partial
 import multiprocessing as mp
+
+import numpy as np
+import pysam
 pysam.set_verbosity(0)
 
-from . import reportlib, utilib, bamlib, vcflib, contiglib, covlib, bqlib
-#from reportlib import METRICS
+from . import reportlib, utilib, bamlib, vcflib, contiglib, covlib, bqlib, fastio
 
-def call_somatic_mutations(region_tuple,
-                           bam,
-                           reference,
-                           min_mapq,
-                           min_sequence_identity,
-                           min_bq,
-                           min_qlen,
-                           max_qlen,
-                           trim_ends,
-                           indels_window,
-                           mismatch_window_len,
-                           min_ec,
-                           max_softclipping,
-                           z_prob,
-                           check_mem_usage,
-                           collapsed,
-                           min_depth,
-                           bq_profile_contig):
+# Context rows are formatted/written in blocks of this many reference bases (bounds temporaries).
+CTX_BLOCK_BP = 1 << 23
+_N = ord("N")
 
-    #output_dict = dict()
+
+def _write_context_fragment(path, contig, start, end, depth, ref_arr, min_depth, mask_s, mask_e):
+    """Context rows of one contig, exactly as the original write_context_one + `bedtools
+    subtract -A` produced them: positions start < p < end-1 with depth >= min_depth, a
+    reference triplet without 'N', and p outside the (merged, sorted) mask intervals.
+    Returns the fragment's FragmentIndex (None if no row)."""
+    w = fastio.IndexedBgzfWriter(path, contig)
+    try:
+        lo_all, hi_all = start + 1, end - 1                # start < p < end - 1
+        for a in range(lo_all, max(lo_all, hi_all), CTX_BLOCK_BP):
+            b = min(a + CTX_BLOCK_BP, hi_all)
+            d = depth[a:b]
+            keep = d >= min_depth
+            if not keep.any():
+                continue
+            # triplet ref[p-1:p+2] must not contain 'N' (other IUPAC letters pass, as before)
+            keep &= ref_arr[a - 1:b - 1] != _N
+            keep &= ref_arr[a:b] != _N
+            keep &= ref_arr[a + 1:b + 1] != _N
+            # mask intervals overlapping [a, b)
+            i0 = np.searchsorted(mask_e, a, side="right")
+            i1 = np.searchsorted(mask_s, b, side="left")
+            for s, e in zip(mask_s[i0:i1].tolist(), mask_e[i0:i1].tolist()):
+                keep[max(s, a) - a:min(e, b) - a] = False
+            idx = np.flatnonzero(keep)
+            if idx.size == 0:
+                continue
+            pos = idx + a
+            tri = np.stack((ref_arr[pos - 1], ref_arr[pos], ref_arr[pos + 1]), axis=1)
+            data, offs = fastio.format_context_lines(contig, pos, tri, d[idx])
+            w.write_records(data, pos, offs)
+    finally:
+        fi = w.close()
+    return fi
+
+
+def call_somatic_mutations(task):
+    """Per-contig worker. `task` = (index, region_tuple, params dict, lcr (starts, ends)).
+
+    Returns a small dict: report, fragment paths, context FragmentIndex, bq histogram (only
+    on the BQ-profile contig), raw-coverage mean / cap and the high-coverage intervals."""
+    k, region_tuple, P, lcr = task
+    min_mapq = P["min_mapq"]; min_sequence_identity = P["min_sequence_identity"]
+    min_bq = P["min_bq"]; min_qlen = P["min_qlen"]; max_qlen = P["max_qlen"]
+    trim_ends = P["trim_ends"]; indels_window = P["indels_window"]
+    mismatch_window_len = P["mismatch_window_len"]; min_ec = P["min_ec"]
+    max_softclipping = P["max_softclipping"]; z_prob = P["z_prob"]
+    check_mem_usage = P["check_mem_usage"]; collapsed = P["collapsed"]
+    min_depth = P["min_depth"]; bq_profile_contig = P["bq_profile_contig"]
+
     wrk = mp.current_process().name
     report = reportlib.METRICS()
     report.filtering_params = (min_mapq,
@@ -69,7 +105,7 @@ def call_somatic_mutations(region_tuple,
                            min_depth,
                            "collapsed" if collapsed else "duplex"   # read_mode: keep last (METRICS.is_collapsed)
                            )
-    
+
     CONTIG, START, END = region_tuple
     region_len = END - START
     report.total_length_ref += region_len
@@ -77,22 +113,27 @@ def call_somatic_mutations(region_tuple,
 
     depth = np.zeros(region_len, dtype=np.uint16)
     zmw_dict = dict()
-    chr_mutations = []
+    rec_pos = []            # per molecule: int64 positions of its records
+    rec_text = []           # record text up to TYPE (the DEPTH column is appended at write time)
     # duplex BQ profile: only the worker handling bq_profile_contig records it
     bq_hist = bqlib.new_histogram() if CONTIG == bq_profile_contig else None
+    # one OS-seeded generator per task (z rows); never the global numpy state shared by forked workers
+    rng = np.random.default_rng()
+    raw = covlib.RawCoverage()
 
-    with pysam.AlignmentFile(bam, "rb") as bam_file, \
-    pysam.FastaFile(reference) as fasta:
+    with pysam.AlignmentFile(P["bam"], "rb") as bam_file, \
+    pysam.FastaFile(P["reference"]) as fasta:
         ref_seq = fasta.fetch(CONTIG).upper()
-        ref_arr = np.frombuffer(ref_seq.encode("ascii"), dtype=np.uint8) if (bq_hist is not None or collapsed) else None
+        ref_arr = np.frombuffer(ref_seq.encode("ascii"), dtype=np.uint8)
+        bam_len = bam_file.get_reference_length(CONTIG)
 
         for ss_strand in bam_file.fetch(CONTIG, START, END):
+            # raw-read coverage (mosdepth -x -Q 20 equivalent) sees every fetched read
+            raw.add(ss_strand)
             # ------------------------------------------------
             # Applying quality filters
             # ------------------------------------------------
             report.num_reads +=1
-            #strand, zmw= ss_strand.query_name.split("/")[-1], ss_strand.get_tag("zm")
-            #print(ss_strand.query_name, strand, zmw)
 
             if bamlib.discard_low_qual_read(ss_strand, report, min_mapq, min_ec,
                                      min_qlen, max_qlen, max_softclipping,
@@ -104,201 +145,80 @@ def call_somatic_mutations(region_tuple,
             ss_strand = bamlib.remove_useless_tags(ss_strand)
 
             if collapsed:
-                # ------------------------------------------------
                 # Collapsed mode: every read is its own molecule (no fwd/rev pairing)
-                # ------------------------------------------------
                 report.num_zmw += 1
                 if report.num_zmw in check_mem_usage:
                     utilib.cprint(f"[{wrk}]\tMEM OCCUPIED: {utilib.get_stats()}\tRead counter for {CONTIG}: {report.num_zmw}")
-
-                read = bamlib.mask_indels(bamlib.mask_ends(ss_strand, trim_ends), indels_window)
-                s = read.query_sequence.upper()
-                q = np.array(read.query_qualities, dtype=np.uint8)
-                qpos, rpos = bamlib.aligned_pairs_array(read)
-
-                if bq_hist is not None:
-                    bqlib.add_read(bq_hist, qpos, rpos, s, q, ref_arr)
-
-                context_positions, rec_qpos, rec_rpos, rec_type = bamlib.walk_collapsed(
-                    qpos, rpos, s, q, ref_arr, min_bq, z_prob)
-                # no second strand -> no single-strand mismatches to blacklist around
-                report.callable_bps += len(context_positions)
-                depth[context_positions] += 1
-
-                chr_mutations += bamlib.process_mutations_collapsed(read, rec_qpos, rec_rpos, rec_type,
-                                                                    s, q, mismatch_window_len, CONTIG,
-                                                                    read.query_name, ref_seq)
-                continue
-
-            strand, zmw= ss_strand.query_name.split("/")[-1], ss_strand.get_tag("zm")
-            #print(strand, zmw)
-            # ------------------------------------------------
-            # Core duplex-pairing logic
-            # ------------------------------------------------
-            pair = zmw_dict.get(zmw)
-            if pair is None:
-                zmw_dict[zmw] = [ss_strand, None] if strand == "fwd" else [None, ss_strand]
-                continue
-            pair[0 if strand == "fwd" else 1] = ss_strand
-            if pair[0] is None or pair[1] is None:
-                continue
-            report.num_zmw += 1
-
-            if report.num_zmw in check_mem_usage:
-                utilib.cprint(f"[{wrk}]\tMEM OCCUPIED: {utilib.get_stats()}\tZMW counter for {CONTIG}: {report.num_zmw}")
-
-            read1, read2 = pair
-            del zmw_dict[zmw]
-
-            # ------------------------------------------------
-            # Mask read regions (around indels & extremeties)
-            # ------------------------------------------------
-            read1, read2 = bamlib.mask_ends(read1, trim_ends), bamlib.mask_ends(read2, trim_ends)
-            read1, read2 = bamlib.mask_indels(read1, indels_window), bamlib.mask_indels(read2, indels_window)
-
-            s1, s2 = read1.query_sequence.upper(), read2.query_sequence.upper()
-            q1, q2 = np.array(read1.query_qualities, dtype=np.uint8), np.array(read2.query_qualities, dtype=np.uint8)
-            #ln1, ln2 = read1.query_length, read2.query_length
-            aln1, aln2 = read1.get_aligned_pairs(matches_only=True), read2.get_aligned_pairs(matches_only=True)
-            len1, len2 = len(aln1), len(aln2)
-
-            if bq_hist is not None:
-                bqlib.add_duplex(bq_hist, aln1, aln2, s1, s2, q1, q2, ref_arr)
-
-            ####################
-            # if report.num_zmw in np.arange(49000, 50000):
-            #     if CONTIG == "NC_000069.7":
-            #         print(report.num_zmw)
-            #         print(read1.to_string())
-            #         print(read2.to_string())
-
-            ######################
-            # ------------------------------------------------
-            # Walking through the duplex and record positions of interest
-            # ------------------------------------------------
-            context_positions = []
-            list_qpos1=[]
-            list_qpos2=[]
-            list_ref1=[]
-            list_type=[]
-            mismatch_list=[]
-            i=j=0
-
-            while i < len1 and j < len2:
-                qpos1, ref1 = aln1[i]
-                qpos2, ref2 = aln2[j]
-                
-                if ref1 < ref2:
-                    i += 1
-                    continue
-                if ref2 < ref1:
-                    j += 1
-                    continue
-                
-                #idx = ref1 - dupl_start  # offset into masked_region
-
-                if q1[qpos1] >= min_bq and q2[qpos2] >= min_bq:
-                    ref_base = ref_seq[ref1]
-                    b1 = s1[qpos1]
-                    b2 = s2[qpos2]
-                    m1 = (b1 == ref_base)
-                    m2 = (b2 == ref_base)
-
-                    if m1 and m2: ## reference bp
-                        context_positions += [ref1] ## only consider positions within the target region
-                        ### randomly save non-mutated position to have a baseline for cofounding factors
-                        if z_prob >0 :
-                            if random.randint(1, z_prob) == 1:
-                                list_qpos1+=[qpos1]
-                                list_qpos2+=[qpos2]
-                                list_ref1+=[ref1]
-                                list_type+=["z"]
-                            ## store all this info after closing the for loop[CONTIG,ref1,ref1+1,zmw,triplet,ref_base,b1,q1[qpos1],qpos1,ln1,b2, q2[qpos2], qpos2, ln2, "z"])
-                        
-                    elif m1 ^ m2: ##ss mutation
-                        context_positions += [ref1]
-                        list_qpos1+=[qpos1]
-                        list_qpos2+=[qpos2]
-                        list_ref1+=[ref1]
-                        list_type+=["m"]
-
-                        mismatch_list += [ref1]
-                    #triplet = ref_seq[ref1 -1 : ref1+2] 
-                        #mut_dict_per_read[ref1]=[CONTIG,ref1,ref1+1,zmw,triplet,ref_base,b1,q1[qpos1],qpos1,ln1,b2, q2[qpos2], qpos2, ln2, "f" if b2 else "r"]
-
-                    elif b1 == b2: #ds mutation
-                        if ref_base == "N":
-                            i += 1
-                            j += 1
-                            continue
-                        context_positions += [ref1]
-                        list_qpos1+=[qpos1]
-                        list_qpos2+=[qpos2]
-                        list_ref1+=[ref1]
-                        list_type+=["x"]
-
-                        #triplet = ref_seq[ref1 -1 : ref1+2] 
-                        #mut_dict_per_read[ref1]=[CONTIG,ref1,ref1+1,zmw,triplet,ref_base,b1,q1[qpos1],qpos1,ln1,b2, q2[qpos2], qpos2, ln2, "d"]
-                i += 1
-                j += 1
-
-            # ------------------------------------------------
-            # Positions within mismatch_window_len of a mismatch are
-            # error-prone and must not be counted as callable.
-            # ------------------------------------------------
-            if mismatch_list:
-                blacklist = set()
-                for r in mismatch_list:
-                    blacklist.update(range(r - mismatch_window_len, r + mismatch_window_len + 1))
-                callable_positions = [p for p in context_positions if p not in blacklist]
+                q = bamlib.masked_qualities(ss_strand, trim_ends, indels_window)
+                res = bamlib.collapsed_walk(ss_strand, q, CONTIG, ref_seq, ref_arr, min_bq, z_prob,
+                                            mismatch_window_len, rng, bq_hist)
             else:
-                callable_positions = context_positions
+                strand, zmw = ss_strand.query_name.split("/")[-1], ss_strand.get_tag("zm")
+                # ------------------------------------------------
+                # Core duplex-pairing logic
+                # ------------------------------------------------
+                pair = zmw_dict.get(zmw)
+                if pair is None:
+                    zmw_dict[zmw] = [ss_strand, None] if strand == "fwd" else [None, ss_strand]
+                    continue
+                pair[0 if strand == "fwd" else 1] = ss_strand
+                if pair[0] is None or pair[1] is None:
+                    continue
+                report.num_zmw += 1
 
-            report.callable_bps += len(callable_positions)
-            depth[callable_positions] += 1 ## update count of all investigable genome positions
-            
-            mutations_in_read = bamlib.process_mutations(read1, read2, 
-                                                    list_qpos1, list_qpos2,
-                                                    list_ref1, list_type, mismatch_list,
-                                                    s1, s2, q1, q2, 
-                                                    mismatch_window_len, CONTIG,
-                                                    zmw, ref_seq,
-                                                    aln1, aln2)
-            
-            if mutations_in_read:
-                chr_mutations += mutations_in_read
+                if report.num_zmw in check_mem_usage:
+                    utilib.cprint(f"[{wrk}]\tMEM OCCUPIED: {utilib.get_stats()}\tZMW counter for {CONTIG}: {report.num_zmw}")
 
+                read1, read2 = pair
+                del zmw_dict[zmw]
+                # mask read ends + indel neighbourhoods (BQ -> 0), then walk the duplex
+                q1 = bamlib.masked_qualities(read1, trim_ends, indels_window)
+                q2 = bamlib.masked_qualities(read2, trim_ends, indels_window)
+                res = bamlib.duplex_walk(read1, read2, q1, q2, zmw, CONTIG, ref_seq, ref_arr,
+                                         min_bq, z_prob, mismatch_window_len, rng, bq_hist)
 
-    #vcflib.write_mut_bed(mut_file, chr_mutations)
-    #vcflib.write_report(report)
-
+            # positions within mismatch_window_len of a ss-mismatch are already excluded
+            report.callable_bps += res.n_callable
+            depth[res.callable_pos] += 1 ## update count of all investigable genome positions
+            if res.rec_text:
+                rec_pos.append(res.rec_pos)
+                rec_text.extend(res.rec_text)
 
         report.num_discarded += len(zmw_dict.keys())
         report.disc_lack_compl += len(zmw_dict.keys())
         del zmw_dict
 
-        ## add depth to each mutation
-        for mut in chr_mutations:
-            r = mut[1]
-            mut += [depth[r]]
+    # ---- raw-read coverage cap + mask (LCR ∪ high coverage) for this contig ----
+    raw_mean, cap, hc_s, hc_e = covlib.contig_raw_coverage(raw, bam_len, min_depth)
+    del raw
+    mask_s, mask_e = covlib.merge_intervals(lcr, (hc_s, hc_e), length=region_len)
 
-        utilib.cprint(f"[{wrk}]\tMEM OCCUPIED: {utilib.get_stats()}\tZMW counter for {CONTIG}: {report.num_zmw}")
-        #utilib.cprint(f"REPORT OF {CONTIG}\n", color="yellow")
-        utilib.cprint(f"{report}\n", color="yellow")
+    # ---- .muts fragment: rows with depth >= min_depth outside the mask, DEPTH appended ----
+    out_dir, sample = P["out_dir"], P["sample"]
+    mut_frag = os.path.join(out_dir, f".{sample}.muts.{k:05d}.frag.bgz")
+    ctx_frag = os.path.join(out_dir, f".{sample}.context.{k:05d}.frag.bgz")
+    pos = np.concatenate(rec_pos) if rec_pos else np.zeros(0, np.int64)
+    d = depth[pos]
+    keep = (d >= min_depth) & ~covlib.in_intervals(pos, mask_s, mask_e)
+    n_muts = int(np.count_nonzero(keep))
+    with pysam.BGZFile(mut_frag, "wb") as bed:
+        step = 200_000
+        for a in range(0, len(rec_text), step):
+            sl = slice(a, a + step)
+            bed.write("".join(f"{t}\t{x}\n" for t, x, kk in
+                              zip(rec_text[sl], d[sl].tolist(), keep[sl].tolist()) if kk).encode())
+    del rec_text, rec_pos, pos, d, keep
 
-    return report, chr_mutations, depth, bq_hist
+    # ---- .context fragment (indexed) ----
+    ctx_fi = _write_context_fragment(ctx_frag, CONTIG, START, END, depth, ref_arr, min_depth,
+                                     mask_s, mask_e)
 
+    utilib.cprint(f"[{wrk}]\tMEM OCCUPIED: {utilib.get_stats()}\tZMW counter for {CONTIG}: {report.num_zmw}")
+    utilib.cprint(f"{report}\n", color="yellow")
 
-def write_frags(mut_list, ctx_list, region_tuple, reference, out_dir, sample, min_depth, collapsed=False):
-
-    CONTIG, START, END = region_tuple
-    mut_frag = os.path.join(out_dir, f"{sample}.muts.{CONTIG}.frag.bgz")
-    ctx_frag = os.path.join(out_dir, f"{sample}.context.{CONTIG}.frag.bgz")
-
-    vcflib.write_mut_one(mut_frag, mut_list, min_depth, collapsed)
-    vcflib.write_context_one(ctx_frag, CONTIG, START, END, ctx_list, reference, min_depth)
-
-    return mut_frag, ctx_frag
+    return dict(k=k, report=report, mut_frag=mut_frag, n_muts=n_muts, ctx_frag=ctx_frag,
+                ctx_fi=ctx_fi, bq_hist=bq_hist, raw_mean=raw_mean, cap=cap,
+                hc=(CONTIG, hc_s, hc_e))
 
 
 def main(bam,
@@ -345,109 +265,70 @@ def main(bam,
         utilib.cprint(f"ERROR: --bq_profile_contig '{bq_profile_contig}' is not among the analysed contigs (check --region / --exclude).", color="red")
         utilib.exit(1)
 
-    # Bind everything except region_tuple; map the rest over the contigs.
-    # out_dir/sample are bound too, so each worker can write its own fragments.
-    worker = partial(call_somatic_mutations,
-                    bam=bam,
-                    reference=reference,
-                    min_mapq=min_mapq,
-                    min_sequence_identity=min_sequence_identity,
-                    min_bq=min_bq,
-                    min_qlen=min_qlen,
-                    max_qlen=max_qlen,
-                    trim_ends=trim_ends,
-                    indels_window=indels_window,
-                    mismatch_window_len=mismatch_window_len,
-                    min_ec=min_ec,
-                    max_softclipping=max_softclipping,
-                    z_prob=z_prob,
-                    check_mem_usage=checkpoints,
-                    collapsed=collapsed,
-                    min_depth = min_depth,
-                    bq_profile_contig=bq_profile_contig
-                    )
+    # Low-complexity regions, parsed once and handed to each worker for its own contig only.
+    lcr = covlib.parse_lcr_bed(subtract_bed or None, contigs)
 
-    with mp.Pool(processes=nproc) as pool:
-        # results are in the SAME ORDER as contigs_list (pool.map preserves order)
-        results = pool.map(worker, contigs_list)
+    params = dict(bam=bam, reference=reference, out_dir=out_dir, sample=sample,
+                  min_mapq=min_mapq, min_sequence_identity=min_sequence_identity,
+                  min_bq=min_bq, min_qlen=min_qlen, max_qlen=max_qlen, trim_ends=trim_ends,
+                  indels_window=indels_window, mismatch_window_len=mismatch_window_len,
+                  min_ec=min_ec, max_softclipping=max_softclipping, z_prob=z_prob,
+                  check_mem_usage=checkpoints, collapsed=collapsed, min_depth=min_depth,
+                  bq_profile_contig=bq_profile_contig)
+    tasks = [(k, rt, params, lcr[rt[0]]) for k, rt in enumerate(contigs_list)]
+    # largest contigs first: the longest task starts immediately
+    tasks.sort(key=lambda t: -(t[1][2] - t[1][1]))
+
+    results = [None] * len(tasks)
+    ctx = mp.get_context("forkserver")
+    with ctx.Pool(processes=max(1, min(nproc, len(tasks)))) as pool:
+        for r in pool.imap_unordered(call_somatic_mutations, tasks, chunksize=1):
+            results[r["k"]] = r       # back to contigs_list order
+    del tasks, lcr
 
     # ---- merge ----
-    reports   = [r[0] for r in results]
-    mut_list = [r[1] for r in results]   # already in contig order
-    ctx_list = [r[2] for r in results]
-    bq_hist = next(r[3] for r in results if r[3] is not None)
+    reports = [r["report"] for r in results]
+    bq_hist = next(r["bq_hist"] for r in results if r["bq_hist"] is not None)
     merged_report = reportlib.merge_reports(reports)
     utilib.cprint(merged_report)
     print("")
 
-    del results
-
     bqlib.write_bq_profile(bq_hist, out_dir, sample, bq_profile_contig, min_bq, collapsed)
 
-    # Launch the raw-read coverage scan now; it only needs the BAM and runs in
-    # the background, overlapping fragment writing + assembly below.
-    mosdepth_run = covlib.start_mosdepth(bam, out_dir, sample, contigs, threads=nproc)
-
-    worker2 = partial(write_frags,
-                      min_depth = min_depth,
-                      sample=sample,
-                      reference=reference,
-                      out_dir=out_dir,
-                      collapsed=collapsed)
-
-    with mp.Pool(processes=nproc) as pool2:
-        # results are in the SAME ORDER as contigs_list (pool.map preserves order)
-        results2 = pool2.starmap(worker2, zip(mut_list, ctx_list, contigs_list))
-
-
-    mut_frags = [r[0] for r in results2]
-    ctx_frags = [r[1] for r in results2]
-
     # ---- assemble outputs from the per-contig fragments ----
-    # mut-bed: prepend the shared header, concat fragments (no tabix, matching write_mut_bed).
+    # mut-bed: prepend the shared header, concat fragments (no tabix, as before).
     mut_file = os.path.join(out_dir, f"{sample}.muts.bed.gz")
     raw_unit = "read" if collapsed else "single-strand read"
     max_depth_hdr = f"per-contig raw ({raw_unit}) mean+{covlib.SIGMA}*sqrt(mean) @MAPQ{covlib.COV_MAPQ} (high-coverage regions subtracted)"
     mut_header = "\n".join(vcflib.mut_bed_header(sample, reference, merged_report.filtering_params + (max_depth_hdr,) ))
     uno = time.time() / 60
-    vcflib.finalize_bgzf(mut_file, mut_header, mut_frags, tabix_bed=False)
+    fastio.assemble_bgzf(mut_file, mut_header.encode(), [(r["mut_frag"], None) for r in results],
+                         index=False)
     dos = time.time() / 60
     utilib.cprint(f"Writing {os.path.basename(mut_file)} completed. Time elapsed {round(dos - uno,2)} min.")
 
     vcflib.write_report(out_dir, sample, merged_report)
 
-    # context: single-line header, concat fragments, then tabix-index.
+    # context: two-line header, concat fragments, .tbi from the offsets recorded while writing.
     context_file = os.path.join(out_dir, f"{sample}.context.bed.gz")
     header_ctx = f"##Minimum depth: {min_depth}; Maximum depth: per-contig raw ({raw_unit}) mean+{covlib.SIGMA}*sqrt(mean) @MAPQ{covlib.COV_MAPQ} (high-coverage regions subtracted)\n##CONTIG\tSTART\tEND\tREF\tDEPTH\n"
     uno = time.time() / 60
-    vcflib.finalize_bgzf(context_file, header_ctx, ctx_frags, tabix_bed=True)
+    fastio.assemble_bgzf(context_file, header_ctx.encode(),
+                         [(r["ctx_frag"], r["ctx_fi"]) for r in results], index=True)
     dos = time.time() / 60
     utilib.cprint(f"Writing {os.path.basename(context_file)} completed. Time elapsed {round(dos - uno,2)} min.")
 
-    # ---- mask low-complexity + excessive-coverage regions -----------------
-    # Raw-read depth (mosdepth, MAPQ>=20) per contig; intervals reaching
-    # round(mean + 4*sqrt(mean)) are collapsed-repeat / mis-mapping artefacts.
-    # These are merged with the optional --low_complexity_regions BED into a
-    # single mask and subtracted from the assembled .muts / .context in one
-    # bedtools pass each (was two: one per BED). The caller above is untouched.
-    uno = time.time() / 60
-    summary_txt, per_base_bed = covlib.finish_mosdepth(mosdepth_run)
-    contig_means = covlib.parse_contig_means(summary_txt, contigs)
-    max_thr = reportlib.get_maximum_coverage_per_contig(contig_means, min_depth=min_depth)
-    highcov_bed = covlib.high_coverage_bed(per_base_bed, max_thr, out_dir, sample, contigs)
-    covlib.cleanup(summary_txt, per_base_bed)
-
-    mask_bed = covlib.build_mask(out_dir, sample, contigs, subtract_bed or None, highcov_bed)
-    if mask_bed:
-        vcflib.apply_subtract_bed(mut_file, mask_bed, tabix_bed=False)
-        vcflib.apply_subtract_bed(context_file, mask_bed, tabix_bed=True)
-        os.remove(mask_bed)
-        utilib.cprint(f"Masked low-complexity + high-coverage regions from "
-                      f"{os.path.basename(mut_file)} / {os.path.basename(context_file)}.", color="green")
-    else:
-        utilib.cprint("Nothing to mask; .muts / .context unchanged.", color="green")
-    dos = time.time() / 60
-    utilib.cprint(f"Region masking completed. Time elapsed {round(dos - uno,2)} min.")
+    # ---- excessive-coverage report artefacts ----------------------------------
+    # Raw-read depth (MAPQ>=20) per contig; intervals reaching round(mean + 4*sqrt(mean))
+    # are collapsed-repeat / mis-mapping artefacts. Together with --low_complexity_regions
+    # they were already removed from the .muts / .context rows by the workers.
+    contig_means = {r["hc"][0]: r["raw_mean"] for r in results if r["raw_mean"] is not None}
+    max_thr = {r["hc"][0]: r["cap"] for r in results if r["cap"] is not None}
+    hc_by_contig = {r["hc"][0]: r["hc"] for r in results}
+    covlib.write_highcov_bed(out_dir, sample,
+                             [hc_by_contig[c] for c in covlib.bam_header_order(bam, contigs)])
+    utilib.cprint(f"Masked low-complexity + high-coverage regions from "
+                  f"{os.path.basename(mut_file)} / {os.path.basename(context_file)}.", color="green")
 
     vcflib.write_merged_coverages(merged_report, out_dir, sample,
                                   raw_means=contig_means, max_depth=max_thr)

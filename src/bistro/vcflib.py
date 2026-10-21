@@ -1,23 +1,16 @@
 """
 Output I/O for BiStro: builds the BED headers/column glossaries for the
-preprocess and somatic outputs, and provides the bgzf writers that assemble caller.py's
-per-contig fragments into the final .muts.bed.gz / .context.bed.gz /
-.shared.muts.bed.gz files.
+preprocess and somatic outputs, and writes the small text reports. (The BGZF
+fragment writers / assembly now live in fastio.py; the .shared.muts.bed.gz
+writer in sharelib.py.)
 """
 
 import os
-#import sys
-import shutil
-import subprocess
-import pysam
-#import numpy as np
+import gzip
 import json
 from datetime import date
 from dataclasses import asdict
 from . import utilib, __main__
-import time
-import gzip
-import pandas as pd
 
 
 def mode_glossary(collapsed):
@@ -123,74 +116,6 @@ def write_merged_coverages(merged, out_dir, sample, raw_means=None, max_depth=No
     utilib.cprint(f"Report of Chromosome Coverages saved to: {os.path.basename(file_name)}")
 
 
-def write_mut_one(path, mut_list, min_depth, collapsed=False):
-    """Write one contig's mutations as a headerless bgzf fragment.
-
-    Only the lower depth bound is enforced here; the per-contig maximum-depth
-    mask is applied afterwards on the assembled file (see covlib).
-    Collapsed rows carry one read's sub-fields only: STRAND_2 is written as "."."""
-    with pysam.BGZFile(path, "wb") as bed:
-        for mut in mut_list:
-            if mut[-1] >= min_depth:
-                str_mut = [str(x) for x in mut]
-                block1 = ":".join(str_mut[6:15])
-                if collapsed:
-                    block2, rest = ".", str_mut[15:]
-                else:
-                    block2, rest = ":".join(str_mut[15:24]), str_mut[24:]
-                bed.write(("\t".join(x for x in (str_mut[:6]+[block1]+[block2]+rest)) + "\n").encode())
-
-
-def write_context_one(path, contig, start, end, depth, reference, min_depth):
-    """Write one contig's per-position context as a headerless bgzf fragment.
-
-    Only the lower depth bound is enforced here; the per-contig maximum-depth
-    mask is applied afterwards on the assembled file (see covlib)."""
-    with pysam.FastaFile(reference) as fasta, \
-         pysam.BGZFile(path, "wb") as bed:
-        ref_seq = fasta.fetch(contig).upper()
-        for pos, d in enumerate(depth):
-            if pos < end - 1 and pos > start:
-                if d >= min_depth:
-                    triplet = ref_seq[pos - 1:pos + 2]
-                    if "N" not in triplet:
-                        bed.write(f"{contig}\t{pos}\t{pos+1}\t{triplet}\t{d}\n".encode())
-
-
-def apply_subtract_bed(final_path, subtract_bed, tabix_bed=False):
-    """Drop every record of a bgzf BED file that overlaps subtract_bed.
-
-    -A removes the whole record on any overlap — exact for BiStro's 1 bp
-    records, and cheaper than the default coordinate-trimming path."""
-    tmp = final_path + ".subtract.tmp.gz"
-    cmd = ["bash", "-c",
-           f"bedtools subtract -header -A -a {final_path} -b {subtract_bed} | bgzip -c > {tmp}"]
-    subprocess.run(cmd, check=True)
-    os.replace(tmp, final_path)
-    if tabix_bed:
-        pysam.tabix_index(final_path, preset="bed", force=True)
-
-
-def finalize_bgzf(final_path, header, frag_paths, tabix_bed=False):
-    """Assemble a single bgzf file from per-contig fragments.
-
-    Writes `header` (str) as the first bgzf member, then appends each fragment's
-    raw bgzf bytes in the given order. Fragment files are deleted after merging.
-    Set tabix_bed=True to build a .tbi index on the result.
-    """
-    with pysam.BGZFile(final_path, "wb") as bed:
-        bed.write(header.encode())
-    with open(final_path, "ab") as out:
-        for p in frag_paths:
-            with open(p, "rb") as f:
-                shutil.copyfileobj(f, out)
-            os.remove(p)
-    if tabix_bed:
-        pysam.tabix_index(final_path, preset="bed", force=True)
-
-
-
-
 def mut_header_shared(samples, collapsed=False):
     g = mode_glossary(collapsed)
 
@@ -274,18 +199,6 @@ def copy_header(src, dst, max_lines=5):
         dst.write(line)
         copied.append(line)
     return copied
-
-
-def write_mut_shared(df, input, samples, output, single=False):
-
-    with gzip.open(input, "rb") as src, pysam.BGZFile(output, "wb") as dst:
-        # the read mode travels in preprocess's ##filters line (read_mode=...)
-        collapsed = any(b"read_mode=collapsed" in line for line in copy_header(src, dst))
-        if single:
-            dst.write(("\n".join(mut_header_single(samples, collapsed))).encode())
-        else:
-            dst.write(("\n".join(mut_header_shared(samples, collapsed))).encode())
-        dst.write(df.to_csv(sep="\t", header=False, index=False).encode())
 
 
 def get_context_header(context_bed, max_lines=1):

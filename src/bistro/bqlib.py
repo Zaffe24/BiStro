@@ -11,10 +11,9 @@ reference is binned by its own BQ (same files, labels say "read").
 
 import os
 import numpy as np
-import matplotlib
-matplotlib.use("Agg")            # headless backend: render straight to a file
-import matplotlib.pyplot as plt
 from . import utilib
+# matplotlib is imported lazily in plot_bq_cumulative: preprocess workers only fill
+# histograms and should not pay for (or depend on) the plotting stack at import time.
 
 N_BQ = 256      # BAM base qualities are uint8
 MIN_HI = 94     # always show the axis up to the PacBio BQ cap (93)
@@ -74,6 +73,13 @@ def add_duplex(hist, aln1, aln2, s1, s2, q1, q2, ref_arr):
     hist += np.bincount(bq, minlength=N_BQ)
 
 
+def add_counts(hist, bq):
+    """Add base qualities (uint8 array) to hist, one count each. bamlib.duplex_walk calls
+    it with min(fwd BQ, rev BQ) of the already-intersected duplex positions whose two
+    bases both match the reference: the same values add_duplex bins."""
+    hist += np.bincount(bq, minlength=N_BQ)
+
+
 def add_read(hist, qpos, rpos, seq, qual, ref_arr):
     """Collapsed mode: add one read's reference-matching bases to hist, by BQ.
     qpos/rpos: bamlib.aligned_pairs_array of the read; qual: masked qualities."""
@@ -125,6 +131,10 @@ def write_bq_profile(hist, out_dir, sample, contig, min_bq, collapsed=False):
 def plot_bq_cumulative(frac_ge, n, out_pdf, sample, contig, min_bq, collapsed=False):
     """Single curve: fraction of matched duplex base-pairs with both strands BQ >= X
     (collapsed: fraction of matched read bases with BQ >= X)."""
+    import matplotlib
+    matplotlib.use("Agg")            # headless backend: render straight to a file
+    import matplotlib.pyplot as plt
+
     hi = len(frac_ge)
     x = np.arange(hi)
 

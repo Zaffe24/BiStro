@@ -5,21 +5,43 @@ space callable in ALL samples, reclassifies de novo (DNM) calls as
 germline/false-positive when they recur across samples, across reads of the
 same ZMW, or have raw read support in other samples' BAMs, and reports each
 sample's resulting somatic mutation rate with a Poisson confidence interval.
+
+Implementation (efficiency refactor; results identical to the original):
+
+* Shared callable space. The original extracted every sample's per-base context
+  per chromosome into uncompressed temp files, ran `bedtools multiinter`, and
+  then streamed each sample's whole context through `bedtools intersect` in one
+  worker per sample. Here the genome is cut into ranges of RANGE_BP; for every
+  (sample, range) a worker streams that range of the sample's context via tabix
+  and returns a packed presence bitmap (pass 1); the parent ANDs the bitmaps of
+  all samples into the shared-space bitmap of the range; a second task per
+  (sample, range) re-streams the range, keeps the lines whose position is shared
+  (verbatim text, as `bedtools intersect` reported them), writes them to an
+  indexed BGZF fragment and sums their DEPTH (pass 2). Fragments are
+  concatenated per sample and the .tbi is written from the offsets recorded
+  while writing (no re-scan). Nothing per-base crosses a process boundary
+  except one bit per base of the range being processed, and nothing is written
+  to TMPDIR.
+* Mutations. Each .muts.bed.gz is read once; every row keeps its original text
+  line (the original round-tripped the 12 columns through pandas, which prints
+  them back unchanged) plus the few parsed columns the logic needs.
+* Pileup safeguard. Every (BAM, site) pair is counted once, sites sorted and
+  clustered, in parallel tasks, by allelelib.count_alleles (same per-site result
+  as the original per-site pysam pileup, much faster).
 """
 
 import gzip
 import os
-import tempfile
-import pandas as pd
-import subprocess
-import pysam
-from functools import partial
-from collections import defaultdict
-from . import vcflib, utilib, contiglib
-import multiprocessing as mp
-from scipy.stats import chi2
 import time
+import multiprocessing as mp
+from collections import OrderedDict
+
 import numpy as np
+import pandas as pd
+import pysam
+from scipy.stats import chi2
+
+from . import vcflib, utilib, contiglib, fastio, allelelib
 pysam.set_verbosity(0)
 
 # Column order of .muts.bed.gz files (no header line in the file)
@@ -35,83 +57,28 @@ ANN_DICT = {"z":"RDM",   # random non-mutated site
             "g":"GRM",   # germline variant (assigned by cross-sample recurrence in annotate_muts)
             "x":"DNM"}   # ds-mutation: de novo unless annotate_muts reclassifies it
 
+# Index into the [A, C, G, T] count rows returned by count_alleles.
+BASE_INDEX = {"A": 0, "C": 1, "G": 2, "T": 3}
+
+# Genome ranges processed per task for the shared-space computation. A multiple of the
+# 16-kb tabix window so no index window is split between two fragments.
+RANGE_BP = 1 << 24
+# Target number of pileup sites per allele-counting task.
+PILEUP_SITES_PER_TASK = 2000
+CTX_NCOLS = 5          # CONTIG START END TRIPLET DEPTH
 
 
-
-def _sort_bed(bed_path, genome_fai):
-    # Sort a BED file in reference chromosome order using Python.
-    # bedtools sort SIGABRT'd on bgzipped input with ## headers; Python avoids that entirely.
-    # Reads chromosome order from the FAI, sorts by (chrom_index, start), strips comment lines.
-    # Returns path to an uncompressed temp file; caller is responsible for deleting it.
-    chrom_idx = {}
-    with open(genome_fai) as fai:
-        for i, line in enumerate(fai):
-            chrom_idx[line.split("\t")[0]] = i
-
-    rows = []
-    with gzip.open(bed_path, "rt") as f:
-        for line in f:
-            if line.startswith("#"):
-                continue
-            fields = line.split("\t", 3)
-            rows.append(((chrom_idx.get(fields[0], len(chrom_idx)), int(fields[1])), line))
-
-    rows.sort(key=lambda x: x[0])
-
-    out = tempfile.NamedTemporaryFile(mode="w", suffix=".bed", delete=False)
-    try:
-        for _, line in rows:
-            out.write(line)
-        out.close()
-        return out.name
-    except Exception:
-        out.close()
-        try: os.unlink(out.name)
-        except OSError: pass
-        raise
+def get_sample_id(mut_bed):
+    return os.path.basename(mut_bed).split(".")[0]
 
 
-def subset_mutations_by_shared_intervals(mut_bed, reference_bed, genome_file):
-    # Streams bedtools output directly into pandas to avoid a double-copy through a temp file.
-    # -sorted requires mut_bed to be coordinate-sorted (caller must ensure this).
-    # -g is required so bedtools tolerates contigs present in -b but absent from -a.
-    proc = subprocess.Popen(
-        ["bedtools", "intersect", "-sorted", "-g", genome_file, "-a", mut_bed, "-b", reference_bed],
-        stdout=subprocess.PIPE, text=True,
-    )
-    try:
-        try:
-            df = pd.read_csv(proc.stdout, sep="\t", header=None, names=COLS)
-        except pd.errors.EmptyDataError:
-            df = pd.DataFrame(columns=COLS)
-    finally:
-        proc.stdout.close()
-        proc.wait()
-    if proc.returncode != 0:
-        raise subprocess.CalledProcessError(proc.returncode, proc.args)
-    # Tuple key used for set-lookup in get_shared_muts; dropped before writing output.
-    # Includes the alternate allele (ALT = first colon-sub-field of STRAND_1) so that two
-    # samples only count as sharing a site when they carry the same substitution.
-    alt = df.strand_1.astype(str).str.split(":").str[0]
-    df["contig_start"] = list(zip(df.contig.astype(str), df.start, alt))
-    return df
-
-
-def get_positions(file_path):
-    # Build a position lookup set for one sample.
-    # Keeps only high-confidence somatic candidates: not random (z) or mismatch (m) type,
-    # and zero mismatches in the QB window (n_mis == 0).
-    # Used by get_shared_muts to detect the same position appearing in multiple samples.
-    positions = set()
-    with gzip.open(file_path, "rt") as f:
-        for line in f:
-            if line.startswith("#"):
-                continue
-            fields = line.split("\t")
-            if fields[10].rstrip() not in ("m", "z") and int(fields[9]) == 0:
-                alt = fields[6].split(":")[0]
-                positions.add((fields[0], int(fields[1]), alt))
-    return positions
+def poisson_rate_cl(k, exposure, alpha=0.05):
+    # exact Poisson confidence interval via chi-squared quantiles.
+    if exposure > 0:
+        lower = 0.0 if k == 0 else chi2.ppf(alpha/2, 2*k) / 2
+        upper = chi2.ppf(1-alpha/2, 2*(k+1)) / 2
+        return lower/exposure, upper/exposure
+    return 0, 0
 
 
 def is_collapsed(mut_bed):
@@ -125,23 +92,85 @@ def is_collapsed(mut_bed):
     return False
 
 
-def get_shared_muts(sample_df, sample_mut, all_positions):
-    # For each mutation, count how many OTHER samples carry a call at the same position.
-    # sum() over boolean Series yields an integer Series (0 = private, N = shared in N others).
-    sample_df["shared"] = sum(
-        sample_df.contig_start.isin(positions)
-        for path, positions in all_positions.items()
-        if path != sample_mut
-    )
-    sample_df = sample_df.drop(columns="contig_start")
-    return sample_df
+# ---------------------------------------------------------------------------
+# Mutation table
+# ---------------------------------------------------------------------------
+def load_muts(mut_bed):
+    """All data rows of a .muts.bed.gz as a slim DataFrame.
+
+    Columns: line (the row's original text, no newline), contig, start, end, zmw, type,
+    n_mis, alt (STRAND_1 up to the first ':'). Text columns are kept exactly as written,
+    numeric ones parsed as int64. Header ('#') lines are skipped, like bedtools did.
+    """
+    with gzip.open(mut_bed, "rt") as fh:
+        # bedtools skipped '#'/track/browser header lines and blank lines
+        lines = [l[:-1] if l.endswith("\n") else l for l in fh
+                 if l.strip() and not l.startswith(("#", "track", "browser"))]
+    if not lines:
+        return pd.DataFrame({"line": pd.Series([], dtype=object),
+                             "contig": pd.Series([], dtype=object),
+                             "start": pd.Series([], dtype=np.int64),
+                             "end": pd.Series([], dtype=np.int64),
+                             "zmw": pd.Series([], dtype=object),
+                             "type": pd.Series([], dtype=object),
+                             "n_mis": pd.Series([], dtype=np.int64),
+                             "alt": pd.Series([], dtype=object)})
+    from io import StringIO
+    # Every field as its exact text (no NA conversion), then parse what the logic needs.
+    tab = pd.read_csv(StringIO("\n".join(lines)), sep="\t", header=None, names=COLS,
+                      usecols=["contig", "start", "end", "zmw", "strand_1", "n_mis", "type"],
+                      dtype=str, na_filter=False, quoting=3)
+    df = pd.DataFrame({
+        "line": pd.Series(lines, dtype=object),
+        "contig": tab["contig"].astype(object),
+        "start": tab["start"].astype(np.int64),
+        "end": tab["end"].astype(np.int64),
+        "zmw": tab["zmw"].astype(object),
+        "type": tab["type"].astype(object),
+        "n_mis": tab["n_mis"].astype(np.int64),
+        "alt": tab["strand_1"].str.split(":", n=1).str[0].astype(object),
+    })
+    return df
+
+
+def position_keys(df):
+    # get_positions() of the original, from the FULL file: high-confidence somatic candidates,
+    # i.e. TYPE not random (z) / mismatch (m) and zero mismatches in the QB window.
+    keep = ~df["type"].str.rstrip().isin(["m", "z"]) & (df["n_mis"] == 0)
+    return df.loc[keep, ["contig", "start", "alt"]].drop_duplicates()
+
+
+def sort_like_original(df, chrom_idx):
+    # The original sorted rows by (reference .fai index of the contig, START) with a stable
+    # sort (unknown contigs last) before `bedtools intersect -sorted`, which keeps that order.
+    idx = df["contig"].map(chrom_idx).fillna(len(chrom_idx)).to_numpy(dtype=np.int64)
+    key = (idx << 32) | df["start"].to_numpy(dtype=np.int64)
+    order = np.argsort(key, kind="stable")
+    return df.iloc[order].reset_index(drop=True)
+
+
+def collapsed_alt_support_filter(mut_df, min_alt_support):
+    # Collapsed mode only: drop mutation calls whose ALT is carried by fewer than min_alt_support
+    # of this sample's reads, so unconfirmed single-read calls never reach the pileup.
+    is_x = mut_df["type"] == "x"
+    support = mut_df.loc[is_x].groupby(["contig", "start", "alt"]).zmw.transform("size")
+    return mut_df.drop(support.index[support < min_alt_support])
+
+
+def get_shared_counts(mut_df, n_total, own_keys):
+    # For each mutation, count how many OTHER samples carry a call at the same (contig,start,ALT):
+    # (number of input files whose key set holds it) - (1 if this file's own set holds it).
+    keys = mut_df[["contig", "start", "alt"]]
+    tot = keys.merge(n_total, on=["contig", "start", "alt"], how="left")["n"].fillna(0)
+    own = keys.merge(own_keys.assign(o=1), on=["contig", "start", "alt"], how="left")["o"].fillna(0)
+    return (tot.to_numpy(dtype=np.int64) - own.to_numpy(dtype=np.int64))
 
 
 def get_zmw_with_multiple_dnm(df,max_muts_per_duplex):
 
     only_dnm = df.loc[df.annotation == "DNM"]
-    counts = only_dnm.groupby("zmw").count()
-    zmw_discarded = counts.loc[counts["annotation"] >= max_muts_per_duplex].index
+    counts = only_dnm.groupby("zmw").size()
+    zmw_discarded = counts.loc[counts >= max_muts_per_duplex].index
     return zmw_discarded.tolist()
 
 
@@ -172,56 +201,17 @@ def annotate_muts(df, thr_shared):
     return df
 
 
-# Index into the [A, C, G, T] count rows returned by count_alleles.
-BASE_INDEX = {"A": 0, "C": 1, "G": 2, "T": 3}
+def dnm_sites(df):
+    # {contig: sorted unique 1-based positions} of this sample's DNM rows (BED END column).
+    dnm = df.loc[df.annotation == ANN_DICT["x"], ["contig", "end"]]
+    return {c: np.unique(g["end"].to_numpy(dtype=np.int64)) for c, g in dnm.groupby("contig", sort=False)}
 
 
-def count_alleles(bam_path, positions_by_contig, min_mapq, min_baseq, max_depth=1_000_000):
-    # Count high-quality A/C/G/T reads at each requested 1-based position.
-    # One pileup call per position: truncate=True yields only the column we asked for, so
-    # nothing is walked between distant mutations. Filtering is done per-read rather than
-    # through pileup()'s own min_base_quality / min_mapping_quality so that
-    # secondary/supplementary/duplicate exclusion is explicit and cannot drift with pysam's
-    # default stepper.
-    counts = {}
-    with pysam.AlignmentFile(bam_path, "rb") as bam:
-        references = set(bam.references)
-        for contig, positions in positions_by_contig.items():
-            if contig not in references:
-                continue
-            for pos in positions:
-                row = [0, 0, 0, 0]
-                counts[(contig, pos)] = row
-                for col in bam.pileup(contig, pos - 1, pos,
-                                      truncate=True,
-                                      min_base_quality=0,
-                                      min_mapping_quality=0,
-                                      max_depth=max_depth):
-                    for read in col.pileups:
-                        if read.is_del or read.is_refskip:
-                            continue
-                        aln = read.alignment
-                        if aln.is_secondary or aln.is_supplementary or aln.is_duplicate:
-                            continue
-                        if aln.mapping_quality < min_mapq:
-                            continue
-                        qpos = read.query_position
-                        if qpos is None:
-                            continue
-                        quals = aln.query_qualities
-                        if quals is None or quals[qpos] < min_baseq:
-                            continue
-                        idx = BASE_INDEX.get(aln.query_sequence[qpos].upper())
-                        if idx is not None:  # N and other ambiguity codes are ignored
-                            row[idx] += 1
-    return counts
-
-
-def flag_fp_denovo(df, other_bams, min_mapq, min_baseq, min_alt_support, min_alt_samples):
+def flag_fp_denovo(df, other_counts, min_alt_support, min_alt_samples):
     # Final safeguard against false-positive de novo calls.
     #
     # A true somatic mutation is private to one organism, so its ALT allele should be absent
-    # from every other sample's raw reads. get_shared_muts only sees positions the caller
+    # from every other sample's raw reads. get_shared_counts only sees positions the caller
     # actually *called* elsewhere; this check goes underneath that detection threshold by
     # counting ALT-supporting reads directly in the other samples' BAMs. A DNM whose ALT is
     # supported by >= min_alt_support reads in >= min_alt_samples other BAMs is reclassified
@@ -231,11 +221,12 @@ def flag_fp_denovo(df, other_bams, min_mapq, min_baseq, min_alt_support, min_alt
     # appear before we stop believing it is private?" — one counts called sites, one counts
     # raw read support.
     #
-    # other_bams: [(sample_id, bam_path), ...]. The per-sample A:C:G:T counts behind the
-    # decision are kept in the COUNTS column so a flagged call can be inspected afterwards.
+    # other_counts: one entry per other BAM, in --bams order: {contig: (positions, counts[n,4])}
+    # from allelelib.count_alleles. The per-sample A:C:G:T counts behind the decision are kept
+    # in the COUNTS column so a flagged call can be inspected afterwards.
     # "." marks rows where no pileup was done (non-DNM rows, or --bams not supplied).
     df["counts"] = "."
-    if not other_bams:
+    if not other_counts:
         return df
 
     dnm = df.loc[df.annotation == ANN_DICT["x"]]
@@ -243,288 +234,246 @@ def flag_fp_denovo(df, other_bams, min_mapq, min_baseq, min_alt_support, min_alt
         return df
 
     # BED end column holds the 1-based coordinate of the substituted base.
-    contigs = dnm.contig.astype(str)
-    positions = dnm.end.astype(int)
-    positions_by_contig = defaultdict(set)
-    for contig, pos in zip(contigs, positions):
-        positions_by_contig[contig].add(pos)
+    contigs = dnm["contig"].to_numpy(dtype=object)
+    positions = dnm["end"].to_numpy(dtype=np.int64)
 
-    # One [A,C,G,T] table per other sample, in the order they appear in --bams.
-    per_sample = [count_alleles(bam, positions_by_contig, min_mapq, min_baseq)
-                  for _, bam in other_bams]
+    # [n_dnm, 4] count table per other sample, rows aligned with dnm (zeros where not counted,
+    # e.g. contig absent from that BAM).
+    per_sample = []
+    for table in other_counts:
+        rows = np.zeros((len(dnm), 4), dtype=np.int64)
+        for c in pd.unique(contigs):
+            sel = np.flatnonzero(contigs == c)
+            if c not in table:
+                continue
+            pos_c, cnt_c = table[c]
+            k = np.searchsorted(pos_c, positions[sel])
+            k_ok = k < pos_c.size
+            hit = np.zeros(sel.size, dtype=bool)
+            hit[k_ok] = pos_c[k[k_ok]] == positions[sel][k_ok]
+            rows[sel[hit]] = cnt_c[k[hit]]
+        per_sample.append(rows)
 
     # A single ALT read is the strictest this check can be, so never let a 0 threshold
     # make every base "supported" and flag every de novo.
     support_thr = max(1, min_alt_support)
-    zeros = [0, 0, 0, 0]
-
-    sites = list(zip(contigs, positions))
-    alts = dnm.strand_1.astype(str).str.split(":").str[0]
 
     # COUNTS: one A:C:G:T field per other sample, comma-separated, order given in the header.
-    df.loc[dnm.index, "counts"] = [
-        ",".join(":".join(map(str, counts.get(site, zeros))) for counts in per_sample)
-        for site in sites
-    ]
+    fields = [[":".join(map(str, r)) for r in rows.tolist()] for rows in per_sample]
+    df.loc[dnm.index, "counts"] = [",".join(f) for f in zip(*fields)]
 
-    is_fp = []
-    for site, alt in zip(sites, alts):
-        idx = BASE_INDEX.get(alt)
-        supporting = 0 if idx is None else sum(
-            counts.get(site, zeros)[idx] >= support_thr for counts in per_sample
-        )
-        is_fp.append(supporting >= min_alt_samples)
+    alts = dnm["alt"].to_numpy(dtype=object)
+    idx = np.array([BASE_INDEX.get(a, -1) for a in alts], dtype=np.int64)
+    supporting = np.zeros(len(dnm), dtype=np.int64)
+    known = idx >= 0
+    for rows in per_sample:
+        supporting[known] += rows[np.flatnonzero(known), idx[known]] >= support_thr
+    is_fp = supporting >= min_alt_samples
     df.loc[dnm.index[is_fp], "annotation"] = "FPD"
     return df
 
 
-def _bed_has_records(bed_path):
-    # True if the (optionally bgzipped) BED has at least one non-comment data line.
-    # Short-circuits on the first record, so it does not read the whole file.
-    with gzip.open(bed_path, "rt") as f:
-        return any(not line.startswith("#") for line in f)
+def write_mut_shared(df, input, samples, output, single=False):
+    # Same header as the original vcflib.write_mut_shared; each row = its original 12-column
+    # text + the added columns (SHARED ANNOTATION COUNTS, or ANNOTATION alone in single mode),
+    # i.e. exactly what df.to_csv(sep="\t") printed. A NaN annotation prints as ''.
+    with gzip.open(input, "rb") as src, pysam.BGZFile(output, "wb") as dst:
+        collapsed = any(b"read_mode=collapsed" in line for line in vcflib.copy_header(src, dst))
+        if single:
+            dst.write(("\n".join(vcflib.mut_header_single(samples, collapsed))).encode())
+        else:
+            dst.write(("\n".join(vcflib.mut_header_shared(samples, collapsed))).encode())
+        ann = df["annotation"].astype(object).where(df["annotation"].notna(), "")
+        if single:
+            cols = [df["line"], ann]
+        else:
+            cols = [df["line"], df["shared"].astype(np.int64).astype(str), ann, df["counts"]]
+        step = 200_000
+        n = len(df)
+        for a in range(0, n, step):
+            block = zip(*(c.iloc[a:a + step].tolist() for c in cols))
+            dst.write(("".join("\t".join(r) + "\n" for r in block)).encode())
 
 
-def subset_context_by_shared_intervals(query_bed, reference_bed_path):
-    # Streams bedtools intersect line by line; never loads the full context into RAM.
-    # stdout.close() sends EOF/SIGPIPE to bedtools if the caller breaks early.
-    #
-    # Guard against bedtools 2.31.1's empty-input quirk: when -a is an empty bgzipped file
-    # it echoes the raw BGZF EOF block to stdout instead of emitting zero records, and
-    # text=True then chokes trying to UTF-8 decode the gzip magic (0x1f 0x8b). An empty
-    # query intersects to nothing anyway, so yield nothing without invoking bedtools.
-    if not _bed_has_records(query_bed):
-        return
-    proc = subprocess.Popen(
-        ["bedtools", "intersect", "-sorted", "-a", query_bed, "-b", reference_bed_path],
-        stdout=subprocess.PIPE, text=True,
-    )
+# ---------------------------------------------------------------------------
+# Shared callable space (pool tasks)
+# ---------------------------------------------------------------------------
+def _presence_task(task):
+    # Pass 1: packed bitmap of the context positions of one sample in [a, b) of one contig.
+    k, s, ctx, contig, a, b = task
+    present = np.zeros(b - a, dtype=bool)
+    for buf in fastio.iter_tabix_chunks(ctx, contig, a, b):
+        ch = fastio.parse_bed_chunk(buf, CTX_NCOLS)
+        pos = fastio.parse_uint_field(ch, 1)
+        present[pos - a] = True
+    return k, s, np.packbits(present)
+
+
+def _shared_task(task):
+    # Pass 2: keep this sample's context lines of [a, b) whose position is in the shared space;
+    # write them verbatim to an indexed BGZF fragment and sum their DEPTH.
+    k, s, ctx, contig, a, b, common_packed, frag = task
+    common = np.unpackbits(common_packed, count=b - a).view(bool)
+    depth_sum = 0
+    n = 0
+    w = fastio.IndexedBgzfWriter(frag, contig)
     try:
-        yield from proc.stdout
+        for buf in fastio.iter_tabix_chunks(ctx, contig, a, b):
+            ch = fastio.parse_bed_chunk(buf, CTX_NCOLS)
+            pos = fastio.parse_uint_field(ch, 1)
+            keep = common[pos - a]
+            nk = int(np.count_nonzero(keep))
+            if nk == 0:
+                continue
+            depth_sum += int(fastio.parse_uint_field(ch, 4)[keep].sum())
+            data, offs = fastio.select_lines(ch, keep)
+            w.write_records(data, pos[keep], offs)
+            n += nk
     finally:
-        proc.stdout.close()  # closes read-end of pipe; signals bedtools if it's still writing
-        proc.wait()
-        if proc.returncode != 0:
-            raise subprocess.CalledProcessError(proc.returncode, proc.args)
+        fi = w.close()
+    return k, s, frag, fi, n, depth_sum
 
 
-def get_sample_id(mut_bed):
-    return os.path.basename(mut_bed).split(".")[0]
-
-def poisson_rate_cl(k, exposure, alpha=0.05):
-    # exact Poisson confidence interval via chi-squared quantiles.
-    if exposure > 0:
-        lower = 0.0 if k == 0 else chi2.ppf(alpha/2, 2*k) / 2
-        upper = chi2.ppf(1-alpha/2, 2*(k+1)) / 2
-        return lower/exposure, upper/exposure
-    return 0, 0
+def _assemble_task(task):
+    final, header, frags = task
+    fastio.assemble_bgzf(final, header, frags, index=True)
+    return final
 
 
-def wrap_worker(mut_bed, intersection, samples_id, all_positions, thr_shared, reference,
-                max_muts_per_duplex, bam_by_mut, min_mapq, min_baseq, min_alt_support):
-    wrk = mp.current_process().name
-    sample_id = get_sample_id(mut_bed)
+def _context_depth_task(task):
+    # Single-sample path: sum of DEPTH over one contig of a context file.
+    ctx, contig = task
+    tot = 0
+    for buf in fastio.iter_tabix_chunks(ctx, contig):
+        tot += int(fastio.parse_uint_field(fastio.parse_bed_chunk(buf, CTX_NCOLS), 4).sum())
+    return tot
 
-    uno = time.time() / 60
-    utilib.cprint(f"[MEM][{wrk}][{sample_id}] worker start: {utilib.get_stats()} GB", color="yellow")
 
-    context_bed = mut_bed.replace("muts.bed.gz", "context.bed.gz")
-    sample_context_out=mut_bed.replace("muts.bed.gz", "shared.context.bed.gz")
-    sample_mut_out=mut_bed.replace("muts.bed.gz", "shared.muts.bed.gz")
+def _make_ranges(reference, contexts):
+    # [(contig, a, b)] in reference (.fai) order over the contigs present in EVERY sample's context
+    # index. A contig missing from any sample has an empty shared space (as with multiinter == n).
+    present = None
+    for ctx in contexts:
+        cs = set(fastio.tabix_contigs(ctx))
+        present = cs if present is None else present & cs
+    ranges = []
+    for contig, _, length in contiglib.get_contig_list(reference, None, None):
+        if contig not in present:
+            continue
+        for a in range(0, length, RANGE_BP):
+            ranges.append((contig, a, min(a + RANGE_BP, length)))
+    return ranges
 
-    # Step 1: filter this sample's context to the shared genomic space and sum the denominator.
-    # col 4 of context.bed.gz holds the base count for that interval (rate denominator).
-    denominator = 0
-    with pysam.BGZFile(sample_context_out, "wb") as out_context:
-        write=out_context.write
-        write(f"##INTERVALS FROM {sample_id} SHARED ACROSS: {" ".join(samples_id)}\n".encode())
-        write(b"".join(vcflib.get_context_header(context_bed)))
-        for line in subset_context_by_shared_intervals(context_bed, intersection):
-            write(line.encode())
-            fields = line.split("\t")
-            denominator += int(fields[4])
 
-    # tabix index required so the shared context file can be used as -b in bedtools below
-    pysam.tabix_index(sample_context_out, preset="bed", force=True)
+def shared_space(pool, paths_id, contexts, header_ids, reference, out_dir):
+    """Compute the shared callable space and every sample's shared-context fragments.
 
-    dos = time.time() / 60
-    utilib.cprint(f"[MEM][{wrk}][{sample_id}] after context filter: {utilib.get_stats()} GB | denominator={denominator:,} bp | time={round(dos-uno,2)} min", color="yellow")
+    paths_id/contexts: one entry per distinct input file; header_ids: the sample list printed in
+    the shared-context header (every -i entry, as in the original). Returns (denominators per
+    file, {contig: [(a, b, common_packed)]}, assembly tasks for _assemble_task)."""
+    n = len(contexts)
+    ranges = _make_ranges(reference, contexts)
+    utilib.cprint(f"[MEM] shared space: {len(ranges)} range(s) x {n} samples. Mem: {utilib.get_stats()} GB")
 
-    # Step 2: restrict mutations to the shared context, annotate, and count true de novos.
-    # mut_bed is not coordinate-sorted, so sort it first to enable -sorted in bedtools intersect.
-    # Use the reference .fai to enforce reference chromosome order, matching the context/intersection files.
-    sorted_mut = _sort_bed(mut_bed, reference + ".fai")
-    try:
-        mut_df = subset_mutations_by_shared_intervals(sorted_mut, sample_context_out, reference + ".fai")
-    finally:
-        os.unlink(sorted_mut)
-    utilib.cprint(f"[MEM][{wrk}][{sample_id}] after mut_df load: {utilib.get_stats()} GB | rows={len(mut_df)}", color="yellow")
+    # Largest ranges first keeps the pool busy until the end.
+    order = sorted(range(len(ranges)), key=lambda k: -(ranges[k][2] - ranges[k][1]))
+    tasks1 = [(k, s, contexts[s], *ranges[k]) for k in order for s in range(n)]
+    common = [None] * len(ranges)
+    seen = [0] * len(ranges)
+    for k, s, bits in pool.imap_unordered(_presence_task, tasks1):
+        common[k] = bits if common[k] is None else np.bitwise_and(common[k], bits, out=common[k])
+        seen[k] += 1
+    assert all(c == n for c in seen)
+    utilib.cprint(f"[MEM] shared-space bitmaps done. Mem: {utilib.get_stats()} GB")
 
-    # Collapsed mode only: drop mutation calls whose ALT is carried by fewer than min_alt_support
-    # of this sample's reads, so unconfirmed single-read calls never reach the pileup.
-    if is_collapsed(mut_bed):
-        is_x = mut_df.type == "x"
-        support = mut_df.loc[is_x].groupby("contig_start").zmw.transform("size")
-        mut_df = mut_df.drop(support.index[support < min_alt_support])
-        utilib.cprint(f"[MEM][{wrk}][{sample_id}] after collapsed ALT-support filter (>= {min_alt_support} reads): rows={len(mut_df)}", color="yellow")
+    frag_dir = out_dir
+    tasks2 = []
+    for k in order:
+        if not common[k].any():
+            continue
+        for s in range(n):
+            frag = os.path.join(frag_dir, f".{paths_id[s]}.shared.context.r{k:06d}.frag.bgz")
+            tasks2.append((k, s, contexts[s], *ranges[k], common[k], frag))
+    frags = [dict() for _ in range(n)]           # per sample: k -> (frag path, FragmentIndex)
+    denominators = [0] * n
+    for k, s, frag, fi, nk, dsum in pool.imap_unordered(_shared_task, tasks2):
+        frags[s][k] = (frag, fi)
+        denominators[s] += dsum
+    utilib.cprint(f"[MEM] shared-context fragments written. Mem: {utilib.get_stats()} GB")
 
-    # WARNING: iterating all_positions here touches every Python object in the inherited dict,
-    # breaking copy-on-write and causing each worker to copy the full dict into its own RSS.
-    mut_df = get_shared_muts(mut_df, mut_bed, all_positions)
-    utilib.cprint(f"[MEM][{wrk}][{sample_id}] after get_shared_muts: {utilib.get_stats()} GB", color="yellow")
+    by_contig = OrderedDict()
+    for k, (contig, a, b) in enumerate(ranges):
+        by_contig.setdefault(contig, []).append((a, b, common[k]))
 
-    mut_df = annotate_muts(mut_df, thr_shared)
+    assembly = []
+    for s in range(n):
+        out = contexts[s].replace("context.bed.gz", "shared.context.bed.gz")
+        header = (f"##INTERVALS FROM {paths_id[s]} SHARED ACROSS: {' '.join(header_ids)}\n".encode()
+                  + b"".join(vcflib.get_context_header(contexts[s])))
+        # fragments in reference order; an empty fragment (no kept line) carries no index
+        fl = [frags[s][k] for k in range(len(ranges)) if k in frags[s]]
+        assembly.append((out, header, fl))
+    return denominators, by_contig, assembly
 
-    # Step 3: per-read check, ahead of the pileup, to flag ZMWs with an implausible number of
-    # DNMs before spending time piling up their positions in other samples' BAMs.
-    mut_df = flag_zmw_with_multiple_dnm(mut_df, max_muts_per_duplex)
 
-    # Step 4: final safeguard — drop de novos whose ALT allele has read support in other BAMs.
-    # thr_shared doubles as the number of supporting samples required (see flag_fp_denovo).
-    # bam_by_mut preserves the -i order, so the COUNTS fields line up with the header's
-    # OTHER SAMPLES list for every sample.
-    other_bams = [(get_sample_id(m), bam) for m, bam in bam_by_mut.items() if m != mut_bed]
-    tres = time.time() / 60
-    mut_df = flag_fp_denovo(mut_df, other_bams, min_mapq, min_baseq, min_alt_support, thr_shared)
-    quattro = time.time() / 60
-    utilib.cprint(f"[MEM][{wrk}][{sample_id}] after flag_fp_denovo ({len(other_bams)} BAMs): {utilib.get_stats()} GB | time={round(quattro-tres,2)} min", color="yellow")
+def in_shared_space(df, by_contig):
+    # Boolean mask: row START lies in the shared space (bit lookup in the packed range bitmaps).
+    keep = np.zeros(len(df), dtype=bool)
+    contigs = df["contig"].to_numpy(dtype=object)
+    starts = df["start"].to_numpy(dtype=np.int64)
+    for c in pd.unique(contigs):
+        if c not in by_contig:
+            continue
+        sel = np.flatnonzero(contigs == c)
+        st = starts[sel]
+        for a, b, packed in by_contig[c]:
+            inr = (st >= a) & (st < b)
+            if not inr.any():
+                continue
+            off = st[inr] - a
+            bits = (packed[off >> 3] >> (7 - (off & 7))) & 1
+            keep[sel[inr]] = bits.astype(bool)
+    return keep
 
-    # numerator = mutations that survive germline reclassification (true de novos)
-    numerator = len(mut_df.loc[mut_df.annotation == "DNM"])
 
-    vcflib.write_mut_shared(mut_df, mut_bed, samples_id, sample_mut_out)
-    utilib.cprint(f"[MEM][{wrk}][{sample_id}] done: {utilib.get_stats()} GB | numerator={numerator}", color="yellow")
+# ---------------------------------------------------------------------------
+# Driver
+# ---------------------------------------------------------------------------
+def _pool(nproc):
+    # forkserver: workers start lean (no copy of the parent's tables) on every Python version.
+    return mp.get_context("forkserver").Pool(processes=max(1, nproc))
+
+
+def single_sample(mut, thr_shared, max_muts_per_duplex, nproc):
+    # Single-sample path: no cross-sample intersection needed.
+    # Annotate mutations from the full context without shared-interval filtering.
+    mut_out = mut.replace("muts.bed.gz", "revised.muts.bed.gz")
+    context_bed = mut.replace("muts.bed.gz", "context.bed.gz")
+    sample_id = get_sample_id(mut)
+    out_dir = os.path.dirname(mut)
+    out_file = os.path.join(out_dir,f"{sample_id}.mutation_rates.tsv")
+    df_mut = load_muts(mut)
+
+    # No other BAMs to pile up against here, so the ZMW check follows annotate_muts directly.
+    df_mut = annotate_muts(df_mut, thr_shared)
+    df_mut = flag_zmw_with_multiple_dnm(df_mut, max_muts_per_duplex)
+
+    # Denominator = sum of DEPTH over the whole context (the original's per-line loop crashed:
+    # it split bytes lines by a str separator).
+    with _pool(nproc) as pool:
+        denominator = sum(pool.map(_context_depth_task,
+                                   [(context_bed, c) for c in fastio.tabix_contigs(context_bed)]))
+    numerator = int((df_mut.annotation == ANN_DICT["x"]).sum())
 
     cl1, cl2 = poisson_rate_cl(numerator,denominator)
     rate =  numerator/denominator if denominator > 0 else 0
+
+    # [sample_id]: the original passed the bare string, so the header listed its characters.
+    write_mut_shared(df_mut, mut, [sample_id], mut_out, single=True)
     output = "\t".join([sample_id, str(rate), str(cl1), str(cl2), str(numerator), str(denominator)])
-    return output
+    vcflib.write_mut_rate([output], out_file)
 
 
-# Module-level globals used to share large data with forked workers without pickling.
-# _g_all_positions must be assigned BEFORE the Pool is created so the fork() call
-# captures it in every child; _worker_init then copies it into a per-process dict
-# alongside the smaller per-run arguments (intersection path, sample list, threshold).
-_worker_state = {}
-_g_all_positions = None
-
-
-def _worker_init(intersection_path, samples_id, thr_shared, reference, max_muts_per_duplex,
-                 bam_by_mut, min_mapq, min_baseq, min_alt_support):
-    _worker_state['all_positions'] = _g_all_positions  # no pickling; inherited via fork
-    _worker_state['intersection'] = intersection_path
-    _worker_state['samples_id'] = samples_id
-    _worker_state['thr_shared'] = thr_shared
-    _worker_state['reference'] = reference
-    _worker_state['max_muts_per_duplex'] = max_muts_per_duplex
-    _worker_state['bam_by_mut'] = bam_by_mut
-    _worker_state['min_mapq'] = min_mapq
-    _worker_state['min_baseq'] = min_baseq
-    _worker_state['min_alt_support'] = min_alt_support
-
-
-def _wrap_worker_top(mut_bed):
-    # Pool.map requires a single-argument callable; this unpacks the shared worker state.
-    return wrap_worker(
-        mut_bed,
-        intersection=_worker_state['intersection'],
-        samples_id=_worker_state['samples_id'],
-        all_positions=_worker_state['all_positions'],
-        thr_shared=_worker_state['thr_shared'],
-        reference=_worker_state['reference'],
-        max_muts_per_duplex=_worker_state['max_muts_per_duplex'],
-        bam_by_mut=_worker_state['bam_by_mut'],
-        min_mapq=_worker_state['min_mapq'],
-        min_baseq=_worker_state['min_baseq'],
-        min_alt_support=_worker_state['min_alt_support'],
-    )
-
-def get_single_sample_depth(context_bed):
-    out=0
-    with gzip.open(context_bed, "rb") as src:
-        for line in src:
-            if not line.startswith(b"#"):
-                out+=int(line.split("\t")[4])
-    return out
-
-def get_single_sample_muts(mut_bed):
-    df = pd.read_csv(mut_bed, sep="\t", compression="gzip", comment="#", header=None)
-    df.columns = COLS
-    df["annotation"] = df["type"].map(ANN_DICT)
-    return df
-
-###########
-############
-#########
-
-
-def _intersect_chrom(region_tuple, beds, n):
-    # Workers write filtered lines to a temp file and return its path so that only a short
-    # string travels through the multiprocessing pipe, bounding RSS to O(1 chromosome) at a time.
-    CONTIG, _START, _END = region_tuple
-    tmp_files = []
-    out_tmp = None
-    try:
-        for bed in beds:
-            with tempfile.NamedTemporaryFile(mode="w", suffix=".bed", delete=False) as tmp:
-                subprocess.run(["tabix", bed, CONTIG], stdout=tmp, stderr=subprocess.DEVNULL, text=True, check=True)
-                tmp_files.append(tmp.name)
-
-        # If any sample has no coverage on this chromosome, exclude the whole chromosome
-        # from the shared space rather than producing a partial intersection.
-        if any(os.path.getsize(f) == 0 for f in tmp_files):
-            return None
-
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".out.bed", delete=False) as out:
-            out_tmp = out.name
-            proc = subprocess.Popen(["bedtools", "multiinter", "-i", *tmp_files],
-                                    stdout=subprocess.PIPE, text=True)
-            for line in proc.stdout:
-                fields = line.split("\t")
-                # fields[3] = number of input files overlapping this interval;
-                # keep only intervals covered in ALL n samples
-                if int(fields[3]) == n:
-                    out.write(f"{fields[0]}\t{fields[1]}\t{fields[2]}\n")
-            proc.stdout.close()
-            proc.wait()
-            if proc.returncode != 0:
-                raise subprocess.CalledProcessError(proc.returncode, proc.args)
-        return out_tmp
-
-    except Exception:
-        if out_tmp and os.path.exists(out_tmp):
-            os.unlink(out_tmp)
-        raise
-    finally:
-        for f in tmp_files:
-            try: os.unlink(f)
-            except OSError: pass
-
-
-def intersect_context_beds(beds, reference, nproc):
-    # imap preserves chromosome order and lets up to nproc workers run ahead, but since
-    # each result is now a file path (not a list), buffered results consume negligible
-    # memory while waiting. Each file is streamed then deleted before moving to the next.
-    n = len(beds)
-    contigs_list = contiglib.get_contig_list(reference, None, None)
-    worker = partial(_intersect_chrom, beds=beds, n=n)
-    with mp.Pool(processes=nproc) as pool:
-        for i, path in enumerate(pool.imap(worker, contigs_list)):
-            contig = contigs_list[i][0]
-            if path is None:
-                utilib.cprint(f"[MEM] [{contig}] no shared coverage, skipped. Mem: {utilib.get_stats()} GB")
-                continue
-            try:
-                size_mb = os.path.getsize(path) / 1e6
-                utilib.cprint(f"[MEM] [{contig}] shared context: {size_mb:.1f} MB. Mem: {utilib.get_stats()} GB")
-                with open(path) as f:
-                    yield from f
-            finally:
-                os.unlink(path)
-
-##############
-###########
-########
 def main(all_muts, thr_shared, max_muts_per_duplex, nproc, reference,
          bams=None, min_mapq=30, min_baseq=70, min_alt_support=1):
 
@@ -537,104 +486,131 @@ def main(all_muts, thr_shared, max_muts_per_duplex, nproc, reference,
     bam_by_mut = dict(zip(all_muts, bams))
 
     if len(all_muts)<2:
-        # Single-sample path: no cross-sample intersection needed.
-        # Annotate mutations from the full context without shared-interval filtering.
-        mut = all_muts[0]
-        mut_out = mut.replace("muts.bed.gz", "revised.muts.bed.gz")
-        context_bed = mut.replace("muts.bed.gz", "context.bed.gz")
-        sample_id = get_sample_id(mut)
-        out_dir = os.path.dirname(mut)
-        out_file = os.path.join(out_dir,f"{sample_id}.mutation_rates.tsv")
-        df_mut =  get_single_sample_muts(mut)
+        single_sample(all_muts[0], thr_shared, max_muts_per_duplex, nproc)
+        return
 
-        # No other BAMs to pile up against here, so the ZMW check follows annotate_muts directly.
-        df_mut = annotate_muts(df_mut, thr_shared)
-        df_mut = flag_zmw_with_multiple_dnm(df_mut, max_muts_per_duplex)
+    t0 = time.time()
+    out_dir = os.path.dirname(all_muts[0])
+    # One entry per distinct input file (the original keyed its per-file tables by path).
+    paths = list(OrderedDict.fromkeys(all_muts))
+    all_contexts = [m.replace("muts.bed.gz", "context.bed.gz") for m in paths]
+    samples_id = [get_sample_id(b) for b in all_muts]
+    paths_id = [get_sample_id(b) for b in paths]
+    out_file = os.path.join(out_dir, "_".join(samples_id) + ".mutation_rates.tsv")
 
-        denominator = get_single_sample_depth(context_bed)
-        numerator = len(df_mut.loc[df_mut.annotation == ANN_DICT["x"]])
+    chrom_idx = {}
+    with open(reference + ".fai") as fai:
+        for i, line in enumerate(fai):
+            chrom_idx[line.split("\t")[0]] = i
 
-        cl1, cl2 = poisson_rate_cl(numerator,denominator)
-        rate =  numerator/denominator if denominator > 0 else 0
+    with _pool(nproc) as pool:
+        # ---- Phase 1: shared callable space + shared context files -------------------------
+        utilib.cprint(f"[MEM] computing shared callable space (nproc={nproc}). Mem: {utilib.get_stats()} GB")
+        denominators, by_contig, assembly = shared_space(pool, paths_id, all_contexts, samples_id,
+                                                         reference, out_dir)
+        # Concatenating + indexing each sample's shared context only needs the fragments: run it
+        # in the background while the mutations are processed.
+        assembled = pool.map_async(_assemble_task, assembly)
+        utilib.cprint(f"[MEM] shared space done in {round((time.time()-t0)/60, 2)} min. Mem: {utilib.get_stats()} GB")
 
-        vcflib.write_mut_shared(df_mut, mut, sample_id, mut_out, single=True)
-        output = "\t".join([sample_id, str(rate), str(cl1), str(cl2), str(numerator), str(denominator)])
-        vcflib.write_mut_rate([output], out_file)
+        # ---- Phase 2: mutations ------------------------------------------------------------
+        # Cross-sample key sets from the FULL files (before any filter), as get_positions did.
+        tables = {}
+        key_sets = {}
+        for m in paths:
+            df = load_muts(m)
+            key_sets[m] = position_keys(df)
+            tables[m] = df
+        all_keys = pd.concat(key_sets.values(), ignore_index=True)
+        n_total = all_keys.groupby(["contig", "start", "alt"]).size().rename("n").reset_index()
+        utilib.cprint(f"[MEM] position keys loaded: {len(all_keys):,} entries across {len(paths)} samples. Mem: {utilib.get_stats()} GB")
+        del all_keys
 
-    else:
-        global _g_all_positions
-        out_dir = os.path.dirname(all_muts[0])
+        sites_by_path = {}
+        for m in paths:
+            sid = get_sample_id(m)
+            df = tables[m]
+            df = sort_like_original(df.loc[in_shared_space(df, by_contig)], chrom_idx)
+            utilib.cprint(f"[MEM][{sid}] mut rows in shared space: {len(df)}", color="yellow")
+            if is_collapsed(m):
+                df = collapsed_alt_support_filter(df, min_alt_support)
+                utilib.cprint(f"[MEM][{sid}] after collapsed ALT-support filter (>= {min_alt_support} reads): rows={len(df)}", color="yellow")
+            df["shared"] = get_shared_counts(df, n_total, key_sets[m])
+            df = annotate_muts(df, thr_shared)
+            # per-read check, ahead of the pileup, to flag ZMWs with an implausible number of DNMs
+            df = flag_zmw_with_multiple_dnm(df, max_muts_per_duplex)
+            tables[m] = df
+            sites_by_path[m] = dnm_sites(df)
+        del key_sets, n_total
 
-        all_contexts = [m.replace("muts.bed.gz", "context.bed.gz") for m in all_muts]
-        samples_id = [get_sample_id(b) for b in all_muts]
+        # ---- Phase 3: pileup safeguard, each (BAM, site) counted once -------------------------
+        counts_by_path = {}
+        if bam_by_mut:
+            t1 = time.time()
+            tasks = []
+            for m in paths:
+                need = {}
+                for other in paths:
+                    if other == m:
+                        continue
+                    for c, pos in sites_by_path[other].items():
+                        need.setdefault(c, []).append(pos)
+                for c, plist in need.items():
+                    pos = np.unique(np.concatenate(plist))
+                    for chunk in allelelib.split_positions(pos, PILEUP_SITES_PER_TASK):
+                        tasks.append((m, (bam_by_mut[m], c, chunk, min_mapq, min_baseq)))
+            n_sites = sum(len(t[1][2]) for t in tasks)
+            utilib.cprint(f"[MEM] pileup safeguard: {n_sites:,} (BAM, site) pairs in {len(tasks)} task(s)")
+            # biggest tasks first
+            tasks.sort(key=lambda t: -len(t[1][2]))
+            results = pool.map(allelelib.count_alleles_task, [t[1] for t in tasks], chunksize=1)
+            parts = {}
+            for (m, _), (c, pos, cnt) in zip(tasks, results):
+                parts.setdefault(m, {}).setdefault(c, []).append((pos, cnt))
+            for m, per_c in parts.items():
+                table = {}
+                for c, lst in per_c.items():
+                    pos = np.concatenate([p for p, _ in lst])
+                    cnt = np.concatenate([x for _, x in lst])
+                    o = np.argsort(pos, kind="stable")
+                    table[c] = (pos[o], cnt[o])
+                counts_by_path[m] = table
+            utilib.cprint(f"[MEM] pileups done in {round((time.time()-t1)/60, 2)} min. Mem: {utilib.get_stats()} GB")
 
-        # Load mutation positions for all samples BEFORE forking so workers inherit the
-        # dict via copy-on-write without any pickling overhead.
-        utilib.cprint(f"[MEM] before get_positions: {utilib.get_stats()} GB")
-        all_positions = {m: get_positions(m) for m in all_muts}
-        _g_all_positions = all_positions  # must be set before Pool() so workers inherit via fork
-        total_entries = sum(len(v) for v in all_positions.values())
-        utilib.cprint(f"[MEM] all_positions loaded: {total_entries:,} entries across {len(all_muts)} samples. Mem: {utilib.get_stats()} GB")
+        # ---- Phase 4: final annotation, outputs ----------------------------------------------
+        rate_by_path = {}
+        for i, m in enumerate(paths):
+            sid = get_sample_id(m)
+            df = tables.pop(m)
+            # bam_by_mut preserves the -i order, so the COUNTS fields line up with the header's
+            # TOTAL SAMPLES list (minus this sample) for every sample.
+            other = [counts_by_path.get(o, {}) for o in bam_by_mut if o != m]
+            df = flag_fp_denovo(df, other, min_alt_support, thr_shared)
+            # numerator = mutations that survive germline reclassification (true de novos)
+            numerator = int((df.annotation == "DNM").sum())
+            denominator = int(denominators[i])
+            write_mut_shared(df, m, samples_id, m.replace("muts.bed.gz", "shared.muts.bed.gz"))
+            utilib.cprint(f"[MEM][{sid}] done: numerator={numerator} denominator={denominator:,} bp. Mem: {utilib.get_stats()} GB", color="yellow")
+            cl1, cl2 = poisson_rate_cl(numerator, denominator)
+            rate = numerator/denominator if denominator > 0 else 0
+            rate_by_path[m] = "\t".join([sid, str(rate), str(cl1), str(cl2), str(numerator), str(denominator)])
+            del df
 
-        out_file = os.path.join(out_dir, "_".join(samples_id) + ".mutation_rates.tsv")
+        assembled.get()
+        utilib.cprint(f"[MEM] shared context files assembled + indexed. Mem: {utilib.get_stats()} GB")
 
-        # Phase 1: compute the genomic space observable in ALL samples simultaneously.
-        # Result written to a single temp BED on disk; used as -b reference in every worker.
-        # intersection_path assigned before the loop so the finally block can always clean up.
-        utilib.cprint(f"[MEM] starting bedtools multiinter. Mem: {utilib.get_stats()} GB")
-        uno = time.time() / 60
+    results = [rate_by_path[m] for m in all_muts]
+    vcflib.write_mut_rate(results, out_file)
+    utilib.cprint(f"MUTATION RATE FILE SAVED TO: {out_file}")
+    utilib.cprint(f"somatic took {round((time.time()-t0)/60, 2)} minutes")
 
-        intersection_path = None
-        intersection_gz = None
-        try:
-            with tempfile.NamedTemporaryFile(mode="w", suffix=".bed", delete=False) as tmp:
-                intersection_path = tmp.name
-                for line in intersect_context_beds(all_contexts, reference, nproc):
-                    tmp.write(line)
-
-            dos = time.time() / 60
-            intersection_size_mb = os.path.getsize(intersection_path) / 1e6
-            utilib.cprint(f"[MEM] bedtools multiinter done. Intersection file: {intersection_size_mb:.1f} MB. Time: {round(dos-uno,2)} min. Mem: {utilib.get_stats()} GB")
-
-            # Compress and index the intersection file so each worker streams it via the
-            # tabix index instead of loading the full file into memory per subprocess.
-            intersection_gz = intersection_path + ".gz"
-            pysam.tabix_compress(intersection_path, intersection_gz, force=True)
-            pysam.tabix_index(intersection_gz, preset="bed", force=True)
-            os.unlink(intersection_path)
-            intersection_path = None  # plain file gone; cleanup targets .gz and .gz.tbi
-            utilib.cprint(f"[MEM] intersection indexed. Mem: {utilib.get_stats()} GB")
-
-            # Phase 2: per-sample parallel processing — filter context + mutations to shared
-            # intervals, reclassify shared de novos as germline, compute rate per sample.
-            # fork context required so workers inherit _g_all_positions without pickling.
-            utilib.cprint(f"[MEM] before forking pool (nproc={nproc}): {utilib.get_stats()} GB")
-            ctx = mp.get_context("fork")
-            with ctx.Pool(processes=nproc,
-                        initializer=_worker_init,
-                        initargs=(intersection_gz, samples_id, thr_shared, reference, max_muts_per_duplex,
-                                  bam_by_mut, min_mapq, min_baseq, min_alt_support)) as pool:
-                results = pool.map(_wrap_worker_top, all_muts)
-        finally:
-            if intersection_path:
-                try: os.unlink(intersection_path)
+    # Each sample's shared.context.bed.gz is written; where that output exists, the
+    # original per-sample context input is redundant, so reclaim its disk space.
+    for ctx in all_contexts:
+        shared_context = ctx.replace("context.bed.gz", "shared.context.bed.gz")
+        if os.path.exists(shared_context):
+            for f in (ctx, ctx + ".tbi"):
+                try:
+                    os.unlink(f)
+                    utilib.cprint(f"{ctx} DELETED", color="yellow")
                 except OSError: pass
-            if intersection_gz:
-                for f in (intersection_gz, intersection_gz + ".tbi"):
-                    try: os.unlink(f)
-                    except OSError: pass
-            _g_all_positions = None
-
-        vcflib.write_mut_rate(results, out_file)
-        utilib.cprint(f"MUTATION RATE FILE SAVED TO: {out_file}")
-
-        # Each worker has written its shared.context.bed.gz; where that output exists, the
-        # original per-sample context input is redundant, so reclaim its disk space.
-        for ctx in all_contexts:
-            shared_context = ctx.replace("context.bed.gz", "shared.context.bed.gz")
-            if os.path.exists(shared_context):
-                for f in (ctx, ctx + ".tbi"):
-                    try:
-                        os.unlink(f)
-                        utilib.cprint(f"{ctx} DELETED", color="yellow")
-                    except OSError: pass

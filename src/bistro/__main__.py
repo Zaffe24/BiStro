@@ -8,12 +8,16 @@ __version__ = "1.0.0"
 __author__ = "Pietro Zafferani"
 
 
-from . import caller, arglib, utilib, sharelib, normcountlib, cosmiclib
+from . import arglib, utilib
+
+# Each subcommand imports only its own module (lazily): `preprocess` no longer pays for
+# importing pandas / scipy / matplotlib / SigProfilerAssignment in every worker process.
 
 def main():
     parser,options = arglib.parse_args(program_version=__version__)
     if options.sub == "preprocess":  # extract candidate mutations from CCS reads
         utilib.check_num_threads(options.threads)
+        from . import caller
         utilib.check_inputs_preprocess(
             options.bam,
             options.ref,
@@ -48,6 +52,7 @@ def main():
     elif options.sub == "somatic":  # call true somatic mutations across samples
         utilib.check_num_threads(options.threads)
         utilib.check_inputs_somatic(options.i, options.bams)
+        from . import sharelib
         sharelib.main(
             options.i,
             options.thr,
@@ -62,6 +67,7 @@ def main():
     elif options.sub == "sbs96":
         utilib.check_num_threads(options.threads)
         utilib.check_inputs_sbs96(options.context, options.muts, options.ref, options.preset_genome)
+        from . import normcountlib
         normcountlib.main(
             options.context,
             options.muts,
@@ -77,6 +83,7 @@ def main():
     elif options.sub == "cosmic":  # two-tier COSMIC signature attribution across samples
         utilib.check_num_threads(options.threads)
         utilib.check_inputs_cosmic(options.input, options.groups)
+        from . import cosmiclib
         cosmiclib.main(
             options.input,
             options.groups,

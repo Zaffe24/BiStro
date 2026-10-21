@@ -154,7 +154,6 @@ rule call_preprocess:
         # {params.set_up}
         exec > {log} 2>&1
 
-        cd $HOME
         {params.cmd} preprocess \
             --bam {input.bam} \
             --ref {params.reference} \
@@ -196,7 +195,6 @@ rule call_somatic:
         set -euo pipefail
         exec > {log} 2>&1
 
-        cd $HOME
         {params.cmd} somatic \
             -i {input.muts} \
             --bams {input.bams} \
@@ -235,7 +233,6 @@ rule call_sbs96:
         set -euo pipefail
         exec > {log} 2>&1
 
-        cd $HOME
         {params.cmd} sbs96 \
             --context {input.ctx} \
             --muts {input.mut} \
@@ -271,7 +268,6 @@ rule call_cosmic:
         set -euo pipefail
         exec > {log} 2>&1
 
-        cd $HOME
         {params.cmd} cosmic \
             -i {input.normcounts} \
             --groups {input.groups} \
