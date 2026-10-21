@@ -100,5 +100,5 @@ snakemake \
     --snakefile "$SNAKEFILE" \
     --directory "$RUN_DIR" \
     --configfile "$RUN_DIR/config.yaml" \
-    --printshellcmds --executor slurm --jobs 10 \
+    --printshellcmds --executor slurm --cores 36 --jobs 10 \
     --latency-wait 30 --keep-going "$@"
