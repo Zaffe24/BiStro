@@ -269,3 +269,19 @@ A dummy dataset comprising small genomic fractions of samples `E01`-`F01` and a 
 If you use BiStro in your work, please cite it:
 
 > Zafferani, P. BiStro (2026). https://github.com/Zaffe24/BiStro
+## Performance notes (efficiency refactor)
+
+Outputs are identical to the previous implementation (verified file by file on real data, duplex and
+collapsed modes), apart from `##date=` lines and the random TYPE `z` rows. What changed:
+
+- `preprocess`: vectorised duplex walk (~18x faster per ZMW); raw-read coverage cap computed in-process
+  (no separate mosdepth pass); low-complexity + high-coverage mask applied in memory (no `bedtools
+  subtract`); `.tbi` written directly while writing (no tabix re-scan). mosdepth/bedtools are no longer
+  needed; only htslib's `tabix` is used.
+- `somatic`: shared callable space computed per (sample, 16-Mbp range) in parallel from tabix streams,
+  with no per-base temp files (the cause of the previous >100 GB peaks); pileup safeguard counts every
+  (BAM, site) once with a fast CIGAR-based counter.
+- `sbs96`: vectorised context tally and genome trinucleotide counts.
+
+On a 4-sample subset (chr19 + chrM + 3 unplaced contigs, 16 CPUs): preprocess 1210 s -> 165 s (duplex),
+somatic 276 s -> 30 s, sbs96 394 s -> 28 s.

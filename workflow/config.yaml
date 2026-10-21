@@ -66,7 +66,7 @@ custom_resources:
     partition: "short"
 
   call_somatic:
-    mem_mb: 120000
+    mem_mb: 32000     # refactored somatic streams per 16-Mbp range (was 120000); not yet measured on full data
     runtime: 360
     threads: 20
     partition: "short"

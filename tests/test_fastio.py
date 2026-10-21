@@ -321,6 +321,7 @@ def test_bgzf_tell(rng, wd):
         f.seek(end_voff)
         assert f.readline() == b""
     assert gzip.open(path).read() == b"".join(lines)
+    os.remove(path)
 
 
 # --------------------------------------------------------------------------------------------
@@ -776,6 +777,9 @@ def test_misc(rng, wd):
     assert not os.path.exists(final + ".tbi") and gzip.open(final).read() == data
     r = subprocess.run(["tabix", "-f", "-p", "bed", final], capture_output=True)
     assert r.returncode != 0, "tabix unexpectedly indexed pos >= 2**29"
+    os.remove(final)
+    if os.path.exists(final + ".tbi"):
+        os.remove(final + ".tbi")
     # 2**29 - 1 itself is fine (checked against tabix in the edge dataset)
 
     # writer argument checks
