@@ -2,18 +2,18 @@
 `BiStro preprocess` — extracts candidate mutations from CCS reads. For each
 contig (in parallel), walks every ZMW's aligned fwd/rev CCS read pair,
 classifies each jointly-covered position as reference, single-strand
-mismatch, or double-strand (de novo) substitution, tracks per-position read
+mismatch, or double-strand substitution, tracks per-position read
 depth, and writes the resulting mutation and context records to per-contig
 BED fragments that main() then merges into the sample's .muts.bed.gz /
 .context.bed.gz outputs. The `somatic` subcommand (sharelib.py) later decides
 which of these double-strand candidates (TYPE x) are de novo or germline.
 On one contig the walk also records a duplex base-quality profile (bqlib.py).
 
-With --collapsed, reads are not paired: every read that passes the filters is
+With --collapsed, reads pass from by-strand to consensus mode: every read that passes the filters is
 its own molecule and is walked on its own (bamlib.collapsed_walk), so there are
 no single-strand mismatches (TYPE m) and nothing is blacklisted around them.
 
-Efficiency refactor (results identical to the original):
+Efficiency refactor:
 * One worker per contig does everything for that contig: the walk (vectorised,
   bamlib.duplex_walk / collapsed_walk), the raw-read coverage that mosdepth used
   to compute in a second pass over the BAM (covlib.RawCoverage, fed with the reads

@@ -54,7 +54,7 @@ def parse_args(program_version, arguments=sys.argv[1:]):
         "--bam",
         type=str,
         required=True,
-        help="BAM file with single-strand CCS reads aligned via 'pbmm2 align --preset CCS'.",
+        help="BAM file with CCS reads aligned via 'pbmm2 align --preset CCS'.",
     )
     parser_preprocess.add_argument(
         "-r",
@@ -139,14 +139,14 @@ def parse_args(program_version, arguments=sys.argv[1:]):
     parser_preprocess.add_argument(
         "--min_depth",
         type=int,
-        default=3,
+        default=1,
         required=False,
         help="Minimum read coverage to be considered in mutation calling.",
     )
     parser_preprocess.add_argument(
         "--trim_ends",
         type=float,
-        default=.025,
+        default=50,
         required=False,
         help="Number of bases to trim from the start and end of each read. If < 1, interpreted as a proportion of the read length; if >= 1, interpreted as an absolute number of bases.",
     )
@@ -162,7 +162,7 @@ def parse_args(program_version, arguments=sys.argv[1:]):
         type=int,
         default=20,
         required=False,
-        help="Window size for mismatches filtering. Mismatches within this window around a candidate variant will be recorded.",
+        help="Window size for mismatches filtering. Mismatches within this window around a candidate variant will be recorded. Only if --collapsed=True",
     )
     parser_preprocess.add_argument(
         "--min_ec",
@@ -195,7 +195,8 @@ def parse_args(program_version, arguments=sys.argv[1:]):
     parser_preprocess.add_argument(
         "--collapsed",
         action="store_true",
-        help="Collapsed reads (e.g. standard PacBio HiFi): treat every read as an independent molecule instead of pairing the fwd/rev single-strand reads of a ZMW into a duplex. All filters apply; single-strand mismatches (TYPE m, their masking, N_MIS) do not exist in this mode.",
+        default=False,
+        help="Collapsed reads (e.g. standard PacBio HiFi): treat every read as an independent molecule instead of pairing the fwd/rev single-strand reads of a ZMW into a duplex.",
     )
     parser_preprocess.add_argument(
         "--low_complexity_regions",

@@ -103,7 +103,8 @@ def write_merged_coverages(merged, out_dir, sample, raw_means=None, max_depth=No
             f.write("## DUPLEX_COVERAGE = CALLABLE_BPS / LENGTH (mean BiStro molecule depth; collapsed mode: reads).\n")
         else:
             f.write("## DUPLEX_COVERAGE = CALLABLE_BPS / LENGTH (mean BiStro duplex depth).\n")
-        f.write("## RAW_COVERAGE   = mean raw-read depth from mosdepth, MAPQ>=20.\n")
+        raw_unit = "read" if merged.is_collapsed() else "single-strand read"
+        f.write(f"## RAW_COVERAGE   = mean raw {raw_unit} depth, MAPQ>=20, no other filters.\n")
         f.write("## MAX_DEPTH      = round(RAW_COVERAGE + 4*sqrt(RAW_COVERAGE)); reference\n")
         f.write("##   intervals whose raw depth reached this were removed from the\n")
         f.write("##   .muts.bed.gz / .context.bed.gz outputs.\n")

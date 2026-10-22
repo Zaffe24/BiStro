@@ -42,21 +42,12 @@ where freq_G_new(c) is the position-unique callable composition — R(c), each
 callable position in shared.context.bed.gz counted once regardless of depth,
 divided by its sum over the 32 contexts. This rescales the spectrum to the
 composition of the *callable* genome rather than the whole reference. No
-human-opportunity variant is produced for this method. The coverage mask (below)
-is reused unchanged: it flags contexts whose freq_C is too low to trust, which
-does not depend on the freq_G target.
+human-opportunity variant is produced for this method.
 
 The freq_G/freq_C(c) and freq_G(c)_new/freq_C(c) columns report the per-context
 correction factor freq_G(c)/freq_C(c) for the genome method and the alternative
-method respectively.
-
-A context this sample barely covered (freq_C(c) near zero) makes freq_G/freq_C
-huge, so even a single raw count there gets amplified into an outsized,
-unreliable share of the corrected spectrum. Contexts whose factor exceeds 4x
-this sample's own median freq_G/freq_C ratio (over the 32 contexts) are
-masked: their normcount/Human_normcounts are zeroed and normfrac/Human_normfrac
-are renormalized over the surviving contexts. The masked column in the output
-flags which contexts (and thus which sbs96 rows) were excluded this way.
+method respectively. No context is masked, however large its factor; only a
+context with freq_C(c) == 0 (never sampled) gets normcount 0.
 
 Usage:
     BiStro sbs96 \
@@ -742,35 +733,7 @@ PRESET_TRINUC_COUNT = {
 # ---------------------------------------------------------------------------
 # Step 5 — assemble and write the corrected table
 # ---------------------------------------------------------------------------
-# How many times the sample's median freq_G/freq_C ratio a context's own ratio
-# may reach before it is treated as an unreliable outlier rather than genuine
-# signal.
-RATIO_OUTLIER_K = 4
-
-
-def compute_coverage_mask(ccs_freq, genome_freq, tri_lst, k=RATIO_OUTLIER_K):
-    # Flag contexts whose correction factor freq_G(c)/freq_C(c) exceeds k times
-    # this sample's own median ratio (over the contexts that have any coverage
-    # at all). A context with zero coverage has no ratio to compare and is
-    # masked outright, same as apply_correction already treats it (nothing to
-    # rescale).
-    ratios = {
-        tri: genome_freq[tri] / ccs_freq[tri]
-        for tri in tri_lst
-        if ccs_freq[tri] > 0
-    }
-    if not ratios:
-        return {tri: True for tri in tri_lst}
-
-    threshold = k * statistics.median(ratios.values())
-
-    return {
-        tri: (tri not in ratios) or (ratios[tri] > threshold)
-        for tri in tri_lst
-    }
-
-
-def apply_correction(sbs96_counts, sbs96_lst, sbs96_to_tri, ccs_freq, genome_freq, masked):
+def apply_correction(sbs96_counts, sbs96_lst, sbs96_to_tri, ccs_freq, genome_freq):
     # normcount = count * freq_G(c) / freq_C(c), plus the fraction each corrected
     # count represents of the whole corrected spectrum (the 96 fractions sum to
     # 1). freq_G is a parameter so the same correction can be run against either
@@ -781,19 +744,16 @@ def apply_correction(sbs96_counts, sbs96_lst, sbs96_to_tri, ccs_freq, genome_fre
     normcounts = {}
     for sbs96 in sbs96_lst:
         tri = sbs96_to_tri[sbs96]
-        # A context with no callable coverage was never sampled, and a context
-        # flagged by compute_coverage_mask was sampled too little to trust its
-        # correction factor: both stay 0 rather than rescaling a raw count into
-        # an unreliable outsized one.
+        # A context with no callable coverage was never sampled: it stays 0
+        # (there is no factor to rescale by).
         cf = ccs_freq[tri]
         normcounts[sbs96] = (
             sbs96_counts[sbs96] * genome_freq[tri] / cf
-            if cf > 0 and not masked[tri] else 0.0
+            if cf > 0 else 0.0
         )
 
     # The fraction is the coverage/opportunity-independent shape used to compare
-    # mutational spectra. Masked contexts are 0 in normcounts, so they drop out
-    # of norm_total on their own: this renormalizes over the surviving contexts.
+    # mutational spectra.
     norm_total = sum(normcounts.values())
     normfracs = {
         sbs96: (nc / norm_total if norm_total > 0 else 0.0)
@@ -824,17 +784,11 @@ def dump_normcounts(sbs96_counts, sbs96_lst, sbs96_to_tri,
     # opportunity, so the Human_* spectrum is the one to compare against them.
     human_freq = get_trifreq(HUMAN_TRINUC_COUNT)
 
-    # Computed once against this sample's own genome composition: whether a
-    # context's coverage was reliable enough to correct at all doesn't depend
-    # on which target composition (native or human) the correction rescales
-    # to, so the same mask is applied to both.
-    masked = compute_coverage_mask(ccs_freq, genome_freq, list(genome.keys()))
-
     normcounts, normfracs = apply_correction(
-        sbs96_counts, sbs96_lst, sbs96_to_tri, ccs_freq, genome_freq, masked
+        sbs96_counts, sbs96_lst, sbs96_to_tri, ccs_freq, genome_freq
     )
     human_normcounts, human_normfracs = apply_correction(
-        sbs96_counts, sbs96_lst, sbs96_to_tri, ccs_freq, human_freq, masked
+        sbs96_counts, sbs96_lst, sbs96_to_tri, ccs_freq, human_freq
     )
 
     # ---- Alternative freq_G: position-unique callable composition ----
@@ -843,10 +797,10 @@ def dump_normcounts(sbs96_counts, sbs96_lst, sbs96_to_tri,
     # instead of the whole-reference trinucleotide composition. It asks what the
     # spectrum would look like had the reads sampled every context in proportion
     # to how much callable sequence that context covers. No human-composition
-    # variant is computed for this method; the same coverage mask is reused.
+    # variant is computed for this method.
     ref_freq = get_trifreq(ref_callable)
     new_normcounts, new_normfracs = apply_correction(
-        sbs96_counts, sbs96_lst, sbs96_to_tri, ccs_freq, ref_freq, masked
+        sbs96_counts, sbs96_lst, sbs96_to_tri, ccs_freq, ref_freq
     )
 
     # Per-context correction factor freq_G(c)/freq_C(c) for each method, reported
@@ -872,7 +826,6 @@ def dump_normcounts(sbs96_counts, sbs96_lst, sbs96_to_tri,
             "freq_G/freq_C(c)", "freq_G(c)_new/freq_C(c)",
             "genome_tri_count", "ref_callable_tri_count", "duplex_callable_tri_count",
             "Human_normcounts", "Human_normfrac", "freq_G_human", "human_tri_count",
-            "masked",
         ]) + "\n")
 
         for sbs96 in sbs96_lst:
@@ -887,7 +840,6 @@ def dump_normcounts(sbs96_counts, sbs96_lst, sbs96_to_tri,
                 genome[tri], ref_callable[tri], ccs_callable[tri],
                 human_normcounts[sbs96], human_normfracs[sbs96],
                 human_freq[tri], HUMAN_TRINUC_COUNT[tri],
-                masked[tri],
             ]) + "\n")
     # Hand back both the corrected spectrum and its fractions so the caller can
     # plot without re-parsing the TSV.

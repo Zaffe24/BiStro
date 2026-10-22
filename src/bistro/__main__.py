@@ -10,8 +10,6 @@ __author__ = "Pietro Zafferani"
 
 from . import arglib, utilib
 
-# Each subcommand imports only its own module (lazily): `preprocess` no longer pays for
-# importing pandas / scipy / matplotlib / SigProfilerAssignment in every worker process.
 
 def main():
     parser,options = arglib.parse_args(program_version=__version__)
