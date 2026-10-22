@@ -62,10 +62,14 @@ if [[ ! -f "$CONFIG_SRC" ]]; then
 fi
 
 # Absolute path to the pipeline source (where this script + Snakefile live).
-# Under sbatch the script runs from a private SLURM spool dir, so DON'T use
-# ${BASH_SOURCE[0]} -- use the submission directory instead (falls back to the
-# script's own dir when run directly, not via sbatch).
-PIPELINE_DIR="${SLURM_SUBMIT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
+# Prefer the script's own dir. Under sbatch the script runs from a private
+# SLURM spool dir (no Snakefile there), so fall back to the submission dir.
+# Checking the script dir first also covers running directly inside an
+# salloc/interactive allocation, where SLURM_SUBMIT_DIR may be e.g. $HOME.
+PIPELINE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [[ ! -f "$PIPELINE_DIR/Snakefile" && -n "${SLURM_SUBMIT_DIR:-}" ]]; then
+    PIPELINE_DIR="$SLURM_SUBMIT_DIR"
+fi
 SNAKEFILE="$PIPELINE_DIR/Snakefile"
 
 if [[ ! -f "$SNAKEFILE" ]]; then
