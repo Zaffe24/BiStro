@@ -4,7 +4,8 @@
 BiStro is a *de novo* single-nucleotide mutation caller for **CCS reads**  generated via [HiDEF-Seq protocol](https://www.nature.com/articles/s41586-024-07532-8).<br>
 It is available as both a standalone command-line tool and a Snakemake pipeline that chains its four steps across multiple samples.
 
-Unlike standard PacBio library preparation, HiDEF-seq includes two additional nuclease treatments that remove overhangs and damaged DNA molecules, reducing the technical error rate below the somatic mutation rate and enabling detection at single-molecule resolution <br>
+Unlike standard PacBio library preparation, HiDEF-seq includes two additional nuclease treatments that remove overhangs and damaged DNA molecules, reducing the technical error rate below the somatic mutation rate and enabling detection at single-molecule resolution.
+<br>
 To discriminate between germline and *de novo* mutations (DNMs), BiStro relies on a simple assumption: germline (or constitutive) mutations appear consistently across multiple samples (e.g., different tissue biopsies) of the same individual, whereas DNMs are private to each sample due to their extremely low variant allele frequency (VAF). Moreover BiStro corrects somatic SBS96 spectrum and performs signature attribution via [SigProfilerAssignment](https://sigprofilersuite.org/SigProfilerAssignment/) .
 
 <br>
